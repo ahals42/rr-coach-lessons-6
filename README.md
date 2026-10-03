@@ -23,10 +23,11 @@ The browser interface used for testing and demonstration.
 
 ## Running locally
 
-```
-scripts/run_local.sh
-```
+First time setup:
 
-Then open http://localhost:8001.
+1. Copy `.env.example` to `.env` and set `OPENAI_API_KEY`.
+2. Run `scripts/run_local.sh --ingest` to build the Qdrant collections for this copy.
+
+After that, run `scripts/run_local.sh` and open http://localhost:8001.
 
 This version runs only on your machine. It is not deployed.
