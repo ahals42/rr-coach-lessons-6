@@ -39,11 +39,7 @@ LESSON_GOALS: Dict[int, str] = {
     ),
 }
 
-WEEK_FOCUS: Dict[int, str] = {
-    1: "This week's focus: Choose your starting goal. Lessons to complete: 1 and 2.",
-    2: "This week's focus: Shape a goal that fits your life. Lessons to complete: 3 and 4.",
-    3: "This week's focus: Keep going and notice your progress. Lessons to complete: 5 and 6.",
-}
+WEEK_FOCUS: Dict[int, str] = {}
 
 LESSON_TO_WEEK: Dict[int, int] = {1: 1, 2: 1, 3: 2, 4: 2, 5: 3, 6: 3}
 

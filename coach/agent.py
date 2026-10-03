@@ -556,6 +556,8 @@ class CoachAgent:
             override_citations = True
         lesson_goal_num = detect_lesson_goal_request(user_input)
         week_focus_num = detect_week_focus_request(user_input)
+        if week_focus_num is None and re.search(r"\bweek\s*\d+\b|\bweekly focus\b|\bfocus (for|of) (this|that|the) week\b|\bthis week'?s focus\b", user_input, re.IGNORECASE):
+            week_focus_num = -1  # weeks are not part of this version
         if lesson_goal_num is not None:
             override_text = LESSON_GOALS.get(lesson_goal_num, OUT_OF_RANGE_MESSAGE)
             override_citations = True
@@ -841,6 +843,8 @@ class CoachAgent:
         Uses remembered progress (current_lesson/current_week) if known; asks a
         clarifying question otherwise.
         """
+        if not WEEK_FOCUS:
+            return OUT_OF_RANGE_MESSAGE
         wants_goal = "goal" in user_input.lower()
         if wants_goal and self.state.current_lesson is not None:
             return LESSON_GOALS.get(self.state.current_lesson, CLARIFYING_QUESTION)
