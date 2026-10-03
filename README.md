@@ -7,6 +7,7 @@
 - A supplementary support tool for Reframing Retirement participants.
 - M-PAC aligned physical activity behaviour change support for recently retired adults.
 - Grounded in Reframing Retirement lesson material. This version covers lessons 1-6 and Science Behind Lessons 1-3 and 4-6 only.
+- For participants in this study group only. Other participants use the full 10-lesson version.
 
 ## What it is not
 
@@ -27,3 +28,5 @@ scripts/run_local.sh
 ```
 
 Then open http://localhost:8001.
+
+This version runs only on your machine. It is not deployed.
