@@ -1,0 +1,981 @@
+"""Core conversational agent logic with security controls"""
+
+from __future__ import annotations
+
+import re
+import logging
+from typing import Dict, Generator, List, Optional, Pattern
+
+from openai import OpenAI
+
+from coach.prompts import build_coach_prompt
+from rag.retriever import RagRetriever, RetrievalResult, RetrievedChunk
+from rag.router import QueryRouter, RouteDecision
+
+# Import from new modules
+from .constants import (
+    LAYER_CONFIDENCE_THRESHOLD,
+    MAX_HISTORY_MESSAGES,
+    MAX_INPUT_LENGTH,
+    REFERENCE_POOL_SIZE,
+    EARLY_LESSON_MAX,
+    EARLY_LESSON_MARGIN,
+    TIMEFRAME_QUESTION,
+)
+from .state import ConversationState, _PreparedPrompt
+from .inference import (
+    infer_process_layer,
+    pick_layer_question,
+    infer_barrier,
+    infer_activities,
+    infer_time_available,
+    extract_stated_lesson_or_week,
+    SOURCE_REQUEST_PATTERNS,
+    ACTION_SUGGESTION_PATTERNS,
+)
+from .detection.detectors import (
+    detect_lowest_mpac,
+    detect_general_disinterest,
+    detect_emotion_regulation,
+    detect_module_request,
+    detect_lesson_lookup,
+    detect_educational_use_case,
+    detect_mpac_question,
+    detect_sources_only,
+    detect_lesson_overview_request,
+    detect_technical_support_request,
+    detect_chatbot_help_request,
+    detect_lesson_goal_request,
+    detect_week_focus_request,
+    detect_generic_weekly_query,
+    detect_bare_lesson_statement,
+    detect_bare_week_statement,
+    detect_bare_number_reply,
+)
+from .inference import TECHNICAL_SUPPORT_RESPONSE, CHATBOT_HELP_RESPONSE
+from .inference import detect_science_for_lesson, science_module_for_lesson
+from rag.retriever import _SCIENCE_MODULE_NAMES
+from .weekly_focus import (
+    LESSON_GOALS,
+    WEEK_FOCUS,
+    LESSON_TO_WEEK,
+    OUT_OF_RANGE_MESSAGE,
+    CLARIFYING_QUESTION,
+    ambiguous_number_question,
+)
+
+logger = logging.getLogger(__name__)
+
+# Compiled once at import time — used in _maybe_append_mh_disclaimer() on every message
+_MH_TOPIC_PATTERNS: List[Pattern] = [
+    re.compile(r"\bdepress(ed|ion|ive)?\b", re.IGNORECASE),
+    re.compile(r"\banxi(ety|ous|ousness)\b", re.IGNORECASE),
+    re.compile(r"\bantidepressant(s)?\b", re.IGNORECASE),
+    re.compile(r"\bPTSD\b", re.IGNORECASE),
+    re.compile(r"\bOCD\b", re.IGNORECASE),
+    re.compile(r"\bgrief\b|\bgriev(e|ing)\b", re.IGNORECASE),
+    re.compile(r"\bburnout\b|\bburnt\s+out\b|\bburned\s+out\b", re.IGNORECASE),
+    re.compile(r"\bmental\s+health\b", re.IGNORECASE),
+]
+
+_MH_DISCLAIMER = (
+    "If this relates to something you're going through personally, talking with your doctor or a counsellor can be really helpful too."
+)
+
+# Compiled once at import time — used in _validate_input() on every message
+_INJECTION_PATTERNS: List[Pattern] = [
+    re.compile(r"ignore\s+(?:all\s+)?(?:previous|above|prior)\s+(?:instructions|prompts?|commands?)", re.IGNORECASE),
+    re.compile(r"disregard\s+(?:all\s+)?(?:previous|above|prior)\s+(?:instructions|prompts?)", re.IGNORECASE),
+    re.compile(r"new\s+instructions?:", re.IGNORECASE),
+    re.compile(r"system\s+prompt:", re.IGNORECASE),
+    re.compile(r"you\s+are\s+now\s+(?:a|an)", re.IGNORECASE),
+    re.compile(r"\[SYSTEM\]", re.IGNORECASE),
+    re.compile(r"\[ADMIN\]", re.IGNORECASE),
+]
+
+
+class CoachAgent:
+    """Handles conversation state, prompting, and OpenAI calls."""
+
+    def __init__(
+        self,
+        client: OpenAI,
+        model: str,
+        *,
+        temperature: float = 0.3,
+        top_p: float = 0.9,
+        max_tokens: int = 600,
+        retriever: Optional[RagRetriever] = None,
+        router: Optional[QueryRouter] = None,
+        lesson_overviews: Optional[Dict[int, Dict[str, str]]] = None,
+    ) -> None:
+        self.client = client
+        self.model = model
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_tokens = max_tokens
+        self._is_new_gen = model.startswith("gpt-5") or model.startswith("o")
+        self._token_limit_key = "max_completion_tokens" if self._is_new_gen else "max_tokens"
+        self.state = ConversationState()
+        self.history: List[Dict[str, str]] = []
+        self.retriever = retriever
+        self.router = router or QueryRouter()
+        self.latest_retrieval: Optional[RetrievalResult] = None
+        self.last_retrieval_with_results: Optional[RetrievalResult] = None
+        self._last_prefer_science: bool = False
+        self._last_response_mode: str = "default"
+        if lesson_overviews is not None:
+            self.lesson_overviews = lesson_overviews
+        else:
+            # Fallback: load from disk (used when called outside the app, e.g. tests or CLI)
+            from rag.parsing_master import parse_lesson_overviews
+            from rag.config import DATA_DIR, MASTER_FILENAME
+            self.lesson_overviews: Dict[int, Dict[str, str]] = {}
+            try:
+                _data_path = retriever.config.master_data_path if retriever is not None else DATA_DIR / MASTER_FILENAME
+                self.lesson_overviews = parse_lesson_overviews(_data_path)
+                if self.lesson_overviews:
+                    logger.info("Lesson overviews loaded: %d lessons", len(self.lesson_overviews))
+                else:
+                    logger.warning("Lesson overviews loaded but empty — check data file at %s", _data_path)
+            except (OSError, ValueError) as exc:
+                logger.error("Failed to load lesson overviews: %s", exc)
+
+    @property
+    def _sampling_kwargs(self) -> dict:
+        token_limit = 4000 if self._is_new_gen else self.max_tokens
+        kwargs: dict = {self._token_limit_key: token_limit}
+        if not self._is_new_gen:
+            kwargs["temperature"] = self.temperature
+            kwargs["top_p"] = self.top_p
+        return kwargs
+
+    def _validate_input(self, user_input: str) -> None:
+        """
+        Validate user input for security concerns.
+
+        This performs basic sanity checks on user input:
+        - Ensures input is not empty
+        - Enforces maximum length to prevent memory exhaustion
+        - Detects obvious prompt injection attempts (logged but not blocked)
+
+        Args:
+            user_input: User message text
+
+        Raises:
+            ValueError: If input fails validation
+        """
+        if not user_input or not user_input.strip():
+            raise ValueError("Input cannot be empty")
+
+        if len(user_input) > MAX_INPUT_LENGTH:
+            logger.warning(f"Input too long: {len(user_input)} chars (max: {MAX_INPUT_LENGTH})")
+            raise ValueError(f"Input too long. Maximum {MAX_INPUT_LENGTH} characters allowed.")
+
+        # Basic prompt injection detection — patterns compiled at module level
+        for pattern in _INJECTION_PATTERNS:
+            if pattern.search(user_input):
+                logger.warning(f"Potential prompt injection detected: {pattern.pattern}")
+                # Don't reject - just log and continue
+                # The system prompt includes instructions to resist manipulation
+                break
+
+    def _truncate_history(self) -> None:
+        """
+        Truncate conversation history to prevent memory exhaustion.
+
+        Keeps the most recent MAX_HISTORY_MESSAGES messages.
+        """
+        if len(self.history) > MAX_HISTORY_MESSAGES:
+            messages_to_remove = len(self.history) - MAX_HISTORY_MESSAGES
+            logger.info(f"Truncating history: removing {messages_to_remove} oldest messages")
+            self.history = self.history[-MAX_HISTORY_MESSAGES:]
+
+    def generate_response(self, user_input: str) -> str:
+        # Validate input first
+        self._validate_input(user_input)
+
+        prepared = self._prepare_prompt(user_input)
+        self._last_response_mode = prepared.response_mode
+        if prepared.override_citations:
+            assistant_reply = prepared.override_text
+            self._record_exchange(user_input, assistant_reply)
+            return assistant_reply
+
+        completion = self.client.chat.completions.create(
+            model=self.model,
+            **self._sampling_kwargs,
+            messages=prepared.messages,
+        )
+        assistant_reply = completion.choices[0].message.content.strip()
+        assistant_reply = self._postprocess_response(
+            assistant_reply,
+            response_mode=prepared.response_mode,
+            module_reference_sentence=prepared.module_reference_sentence,
+        )
+        assistant_reply = self._maybe_append_citations(assistant_reply, prepared)
+        assistant_reply = self._replace_em_dash(assistant_reply)
+        assistant_reply = self._maybe_append_mh_disclaimer(assistant_reply, user_input)
+        self._record_exchange(user_input, assistant_reply)
+        return assistant_reply
+
+    def stream_response(self, user_input: str) -> Generator[str, None, str]:
+        # Validate input first
+        self._validate_input(user_input)
+
+        prepared = self._prepare_prompt(user_input)
+        self._last_response_mode = prepared.response_mode
+        if prepared.override_citations:
+            reply = prepared.override_text
+            self._record_exchange(user_input, reply)
+            yield reply
+            return reply
+        if prepared.response_mode in {"lowest_mpac", "emotion_education", "educational", "source_request", "mpac_question", "home_resources"}:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                **self._sampling_kwargs,
+                messages=prepared.messages,
+            )
+            assistant_reply = completion.choices[0].message.content.strip()
+            assistant_reply = self._postprocess_response(
+                assistant_reply,
+                response_mode=prepared.response_mode,
+                module_reference_sentence=prepared.module_reference_sentence,
+            )
+            assistant_reply = self._maybe_append_citations(assistant_reply, prepared)
+            assistant_reply = self._replace_em_dash(assistant_reply)
+            assistant_reply = self._maybe_append_mh_disclaimer(assistant_reply, user_input)
+            self._record_exchange(user_input, assistant_reply)
+            yield assistant_reply
+            return assistant_reply
+
+        response_chunks: List[str] = []
+        stream = self.client.chat.completions.create(
+            model=self.model,
+            **self._sampling_kwargs,
+            messages=prepared.messages,
+            stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            text = delta.content or ""
+            text = self._replace_em_dash(text)
+            if not text:
+                continue
+            response_chunks.append(text)
+            yield text
+
+        assistant_reply = "".join(response_chunks).strip()
+        final_reply = self._maybe_append_citations(assistant_reply, prepared)
+        final_reply = self._replace_em_dash(final_reply)
+        final_reply = self._maybe_append_mh_disclaimer(final_reply, user_input)
+        trailing = final_reply[len(assistant_reply):]
+        if trailing:
+            yield trailing
+        self._record_exchange(user_input, final_reply)
+        return final_reply
+
+    def snapshot(self) -> Dict[str, str]:
+        """Return a shallow snapshot of the coach state for monitoring."""
+
+        mapping = self.state.to_prompt_mapping()
+        mapping["history_length"] = str(len(self.history))
+        return mapping
+
+    def _prepare_prompt(self, user_input: str) -> _PreparedPrompt:
+        self._update_state(user_input)
+        context_block = None
+        self.latest_retrieval = None
+        routing_instruction: Optional[str] = None
+        decision: Optional[RouteDecision] = None
+        sources_only_followup = detect_sources_only(user_input)
+        mpac_question = detect_mpac_question(user_input)
+        stated_lesson_now, _ = extract_stated_lesson_or_week(user_input)
+        if stated_lesson_now is not None:
+            self.state.current_lesson = stated_lesson_now
+        science_lesson_num = detect_science_for_lesson(user_input)
+        if science_lesson_num is None and re.search(r"science", user_input, re.IGNORECASE) and re.search(r"\b(this|that|it)\b|\blesson\b", user_input, re.IGNORECASE):
+            science_lesson_num = self.state.current_lesson
+        science_module = None
+        if science_lesson_num is not None and science_lesson_num in self.lesson_overviews:
+            science_module = science_module_for_lesson(science_lesson_num)
+        if self.retriever and not sources_only_followup:
+            decision = self.router.route(user_input)
+            if mpac_question:
+                decision = RouteDecision(
+                    use_master=True,
+                    use_activities=decision.use_activities,
+                    use_home=decision.use_home,
+                    activity_filters=decision.activity_filters,
+                    needs_location_clarification=decision.needs_location_clarification,
+                    prefer_science=True,
+                    home_resource_type=decision.home_resource_type,
+                )
+            # Home context carryover: if the previous turn used home_resources routing and the
+            # current message does not explicitly signal local-activity intent (a recognised
+            # location filter), keep routing to home resources so follow-up turns like
+            # "strength", "yes", or "something gentle" still retrieve home content.
+            elif (
+                self._last_response_mode == "home_resources"
+                and not decision.use_home
+                and not (decision.activity_filters and decision.activity_filters.location)
+            ):
+                decision = RouteDecision(
+                    use_master=False,
+                    use_home=True,
+                    activity_filters=decision.activity_filters,
+                    prefer_science=decision.prefer_science,
+                    home_resource_type=decision.home_resource_type,
+                )
+            if science_module is not None:
+                decision = RouteDecision(
+                    use_master=True,
+                    prefer_science=True,
+                )
+            self._last_prefer_science = decision.prefer_science
+            retrieval_result = self.retriever.gather_context(user_input, decision, science_module=science_module)
+            context_block = retrieval_result.build_prompt_context() if retrieval_result else None
+            self.latest_retrieval = retrieval_result
+            if retrieval_result and (retrieval_result.master_chunks or retrieval_result.activity_chunks or retrieval_result.home_chunks):
+                self.last_retrieval_with_results = retrieval_result
+
+        source_request = self._needs_citations(user_input)
+        sources_only = sources_only_followup
+        lesson_lookup = detect_lesson_lookup(user_input)
+        explicit_module_request = source_request or detect_module_request(user_input) or lesson_lookup
+        general_disinterest = detect_general_disinterest(user_input)
+        lowest_mpac = detect_lowest_mpac(user_input) or general_disinterest
+        emotion_regulation = detect_emotion_regulation(user_input)
+        educational_use_case = detect_educational_use_case(
+            user_input,
+            explicit_module_request=explicit_module_request,
+            decision=decision,
+        )
+
+        home_request = decision.use_home if decision else False
+
+        # Response mode routing determines coaching approach based on user state
+        # - lowest_mpac: Educational only, no action suggestions (unmotivated users)
+        # - mpac_question: Framework explanation grounded in science content
+        # - home_resources: At-home video/playlist/reading suggestions
+        # - emotion_education: Educational support for negative feelings
+        # - educational: Info-focused responses for explicit knowledge requests
+        # - source_request: Concise response with citations
+        # - default: Standard conversational coaching
+        response_mode = "default"
+        response_instruction: Optional[str] = None
+        if lowest_mpac:
+            response_mode = "lowest_mpac"
+            response_instruction = (
+                "Lowest-intention routing: provide educational support only. "
+                "Do NOT suggest activities, action steps, or behavior change. Do not ask questions. "
+                "Never use question marks. Output format: 1-3 sentences total, conversational, no bullet lists, no numbering, no bold. "
+                "Sentence 1 should neutrally acknowledge the feeling or hesitation. Sentence 2 should explain health relevance in plain language. "
+                "If a relevant slide is available, add one final sentence that points to at most two slides as lesson support."
+            )
+        elif mpac_question:
+            response_mode = "mpac_question"
+            response_instruction = (
+                "MPAC-framework routing: the user is asking directly about the M-PAC framework or one of its "
+                "named constructs. You MAY mention M-PAC, its layer names, and its construct names in this response. "
+                "Ground your explanation in the retrieved science content where available. "
+                "Keep the response concise: 2-4 sentences, conversational, no bullet lists, no numbering, no bold. "
+                "After explaining, you may offer one natural follow-up connecting it to the user's own experience."
+            )
+        elif home_request:
+            response_mode = "home_resources"
+            if decision and not decision.activity_filters:
+                # General home query — direct to Resources to browse rather than listing specific resources.
+                # Keep response_mode as home_resources so the carryover fires when the user follows up
+                # with a type preference.
+                context_block = None
+                response_instruction = (
+                    "The user is asking generally about home activities. Direct them to the "
+                    "What Can You Do At Home? section in Resources to browse options. "
+                    "Phrase it naturally, for example: 'A good place to start is the What Can You Do At Home? "
+                    "section in Resources.' Ask one natural follow-up question about what kind of movement "
+                    "interests them (e.g. strength, gentle walking, flexibility, yoga) so you can help them "
+                    "find something specific if they want. Do not list or suggest specific resources or videos."
+                )
+            else:
+                response_instruction = (
+                    "At-home resources routing: the user is asking about activities they can do at home. "
+                    "Suggest 1-3 relevant at-home resources from the retrieved content only — never invent or guess resources. "
+                    "Name each resource by its title and briefly describe what it involves and roughly how long it takes. "
+                    "Do not mention section numbers or resource type labels (no 'Individual Video #4', no 'Video Playlist'). Do not use the word 'blog' — refer to reading resources as 'a short read' or 'a resource in Reframing Retirement'. "
+                    "If a resource title contains gendered language (e.g., 'for women', 'for men'), describe it in gender-neutral terms instead. "
+                    "Tell the user they can find resources like these under Resources > What Can You Do At Home?. "
+                    "Keep the response conversational, no bullet lists, no bold. "
+                    "You may ask one follow-up question about their preference (e.g. duration, intensity, type of movement)."
+                )
+        elif emotion_regulation:
+            response_mode = "emotion_education"
+            response_instruction = (
+                "Emotion-regulation routing: the user expresses negative feelings about activity. "
+                "Provide educational support only, without action suggestions or questions. "
+                "Never use question marks. Output format: 1-3 sentences total, conversational, no bullet lists, no numbering, no bold. "
+                "Sentence 1-2 should summarize the key educational points in plain language. "
+                "If a relevant slide is available, add one final sentence that references one slide as optional lesson support."
+            )
+        elif educational_use_case:
+            response_mode = "educational"
+            response_instruction = (
+                "Educational routing: respond primarily with informational support grounded in relevant slides. "
+                "Never use question marks. Output format: 1-3 sentences total, conversational, no bullet lists, no numbering, no bold. "
+                "Sentence 1-2 should give a concise, plain-language summary. "
+                "If a relevant slide is available, add one final sentence that references one slide as optional lesson support."
+            )
+
+        if source_request and response_mode == "default":
+            response_mode = "source_request"
+            response_instruction = (
+                "Source-request routing: keep the response concise (1-2 sentences), conversational, "
+                "no bullet lists, no numbering, no bold. Do not add source citations in the body; they will be appended."
+            )
+
+        if decision and decision.needs_location_clarification and response_mode == "default":
+            routing_instruction = (
+                "The user mentioned a location that wasn't recognized. Ask a single friendly question like "
+                "\"Do you live near or feel comfortable traveling to downtown, James Bay, Oak Bay, Saanich, Fairfield, or somewhere else nearby?\""
+            )
+
+        # General activity inquiry — no specific location or type filter set.
+        # Direct to the app's Resources section instead of listing specific venues.
+        # Only surface RAG activity content when the user has given enough specificity (location, type, etc.)
+        if (
+            decision
+            and decision.use_activities
+            and not decision.activity_filters
+            and response_mode == "default"
+            and not routing_instruction
+        ):
+            context_block = None
+            routing_instruction = (
+                "The user is asking about activities generally. Direct them to browse the 'What is going on in your area' "
+                "section in Resources. Phrase it naturally — for example: 'The What is going on in your area section in "
+                "Resources is a good place to start' or 'You can browse local options in the What is going on in your "
+                "area section under Resources.' Ask one natural follow-up question — "
+                "either where they tend to be based (neighbourhood or part of the city) or what kind of activity "
+                "interests them — so you can help them narrow it down if they want. "
+                "Do not list or suggest specific activities or venues."
+            )
+
+        allow_module_references = False
+        max_refs = 0
+        prefer_early_lessons = False
+        if lowest_mpac:
+            allow_module_references = True
+            max_refs = 2
+            prefer_early_lessons = True
+        elif mpac_question:
+            allow_module_references = True
+            max_refs = 1
+        elif home_request:
+            pass  # home resource responses don't cite lessons
+        elif emotion_regulation:
+            allow_module_references = True
+            max_refs = 1
+        elif explicit_module_request:
+            allow_module_references = True
+            max_refs = 1
+        elif educational_use_case:
+            allow_module_references = True
+            max_refs = 1
+        elif response_mode == "default":
+            # Skip lesson refs when the response is an activity lookup — they don't belong there
+            if not (decision and decision.use_activities and decision.activity_filters):
+                allow_module_references = True
+                max_refs = 1
+
+        reference_source = self._select_reference_source(self.latest_retrieval)
+        selected_chunks: List[RetrievedChunk] = []
+        if allow_module_references:
+            selected_chunks = self._select_reference_chunks(
+                reference_source,
+                max_refs=max_refs,
+                prefer_early_lessons=prefer_early_lessons,
+            )
+        use_lesson_level_refs = explicit_module_request and not lesson_lookup
+        selected_references = self._format_reference_list(selected_chunks, lesson_level=use_lesson_level_refs)
+        if science_lesson_num is not None:
+            module_num = science_module_for_lesson(science_lesson_num)
+            block = range((module_num - 1) * 3 + 1, module_num * 3 + 1)
+            if any(n in self.lesson_overviews for n in block):
+                selected_references = [_SCIENCE_MODULE_NAMES[module_num]]
+        module_reference_sentence = ""
+        module_reference_instruction: Optional[str] = None
+        if response_mode in {"lowest_mpac", "emotion_education", "educational"}:
+            if response_mode == "lowest_mpac" and general_disinterest:
+                module_reference_sentence = (
+                    "You should check out Lesson 1: Why Physical Activity Matters During Retirement and "
+                    "Lesson 2: The Power of Physical Activity."
+                )
+            else:
+                module_reference_sentence = self._build_module_reference_sentence(
+                    selected_references,
+                    max_refs=max_refs,
+                    tone="direct" if response_mode == "lowest_mpac" else "optional",
+                )
+            if module_reference_sentence:
+                module_reference_instruction = (
+                    "Do not mention module, lesson, or slide names in your response. "
+                    "A module reference sentence will be appended."
+                )
+        if module_reference_instruction is None:
+            module_reference_instruction = self._build_module_reference_instruction(
+                selected_references,
+                max_refs=max_refs,
+                allow=allow_module_references,
+            )
+
+        override_citations = False
+        override_text = ""
+        reference_block_references: List[str] = []
+        if detect_technical_support_request(user_input):
+            override_text = TECHNICAL_SUPPORT_RESPONSE
+            override_citations = True
+        if detect_chatbot_help_request(user_input):
+            override_text = CHATBOT_HELP_RESPONSE
+            override_citations = True
+        lesson_overview_num = detect_lesson_overview_request(user_input)
+        if lesson_overview_num is not None and lesson_overview_num in self.lesson_overviews:
+            overview = self.lesson_overviews[lesson_overview_num]
+            override_text = (
+                f"Lesson {lesson_overview_num}: {overview['title']}. "
+                f"{overview['description']}"
+            )
+            override_citations = True
+        elif lesson_overview_num is not None:
+            override_text = OUT_OF_RANGE_MESSAGE
+            override_citations = True
+        elif science_lesson_num is not None and science_lesson_num not in self.lesson_overviews:
+            override_text = OUT_OF_RANGE_MESSAGE
+            override_citations = True
+        elif lesson_lookup:
+            override_text = self._build_lesson_lookup_response(selected_references)
+            override_citations = True
+        lesson_goal_num = detect_lesson_goal_request(user_input)
+        week_focus_num = detect_week_focus_request(user_input)
+        if lesson_goal_num is not None:
+            override_text = LESSON_GOALS.get(lesson_goal_num, OUT_OF_RANGE_MESSAGE)
+            override_citations = True
+        elif week_focus_num is not None:
+            override_text = WEEK_FOCUS.get(week_focus_num, OUT_OF_RANGE_MESSAGE)
+            override_citations = True
+        elif detect_generic_weekly_query(user_input):
+            override_text = self._build_weekly_query_response(user_input)
+            override_citations = True
+        else:
+            bare_lesson_num = detect_bare_lesson_statement(user_input)
+            bare_week_num = detect_bare_week_statement(user_input)
+            bare_number = detect_bare_number_reply(user_input)
+            if bare_lesson_num is not None:
+                override_text = LESSON_GOALS.get(bare_lesson_num, OUT_OF_RANGE_MESSAGE)
+                override_citations = True
+            elif bare_week_num is not None:
+                override_text = WEEK_FOCUS.get(bare_week_num, OUT_OF_RANGE_MESSAGE)
+                override_citations = True
+            elif bare_number is not None:
+                override_text = ambiguous_number_question(bare_number)
+                override_citations = True
+        if source_request:
+            prefer_science_refs = (decision.prefer_science if decision else False) or (sources_only and self._last_prefer_science)
+            source_chunks = self._select_reference_chunks(
+                reference_source,
+                max_refs=self._reference_pool_limit(reference_source),
+                prefer_early_lessons=False,
+                prefer_science=prefer_science_refs,
+                pool_limit=self._reference_pool_limit(reference_source),
+            )
+            reference_block_references = self._format_reference_list(source_chunks)
+            if reference_block_references and sources_only:
+                override_text = self._append_reference_block(
+                    "",
+                    reference_block_references,
+                    max_refs=len(reference_block_references),
+                )
+                override_citations = True
+
+        messages = self._build_messages(
+            user_input,
+            context_block if not override_citations else None,
+            routing_instruction if not override_citations else None,
+            response_mode=response_mode,
+            response_instruction=response_instruction,
+            module_reference_instruction=module_reference_instruction,
+        )
+        return _PreparedPrompt(
+            messages=messages,
+            needs_citations=source_request and response_mode in {"default", "source_request", "educational"},
+            override_citations=override_citations,
+            override_text=override_text,
+            reference_block_references=reference_block_references,
+            response_mode=response_mode,
+            module_reference_sentence=module_reference_sentence,
+        )
+
+    def _maybe_append_citations(self, text: str, prepared: _PreparedPrompt) -> str:
+        if not prepared.needs_citations:
+            return text
+        max_refs = len(prepared.reference_block_references)
+        return self._append_reference_block(text, prepared.reference_block_references, max_refs=max_refs)
+
+    def _record_exchange(self, user_input: str, assistant_reply: str) -> None:
+        """
+        Record conversation exchange and truncate history if needed.
+
+        Args:
+            user_input: User's message
+            assistant_reply: Assistant's response
+        """
+        self.history.append({"role": "user", "content": user_input})
+        self.history.append({"role": "assistant", "content": assistant_reply})
+
+        # Truncate history to prevent unbounded growth
+        self._truncate_history()
+
+    def _build_messages(
+        self,
+        user_input: str,
+        context_block: Optional[str] = None,
+        routing_instruction: Optional[str] = None,
+        response_mode: str = "default",
+        response_instruction: Optional[str] = None,
+        module_reference_instruction: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        system_prompt = build_coach_prompt(self.state.to_prompt_mapping())
+        messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        if context_block:
+            retrieval_instruction = self._build_retrieval_instruction(response_mode)
+            messages.append({
+                "role": "system",
+                "content": f"{retrieval_instruction}\n\n<retrieved_content>\n{context_block}\n</retrieved_content>",
+            })
+        if response_instruction:
+            messages.append({"role": "system", "content": response_instruction})
+        if module_reference_instruction:
+            messages.append({"role": "system", "content": module_reference_instruction})
+        if routing_instruction:
+            messages.append({"role": "system", "content": routing_instruction})
+        messages.extend(self.history)
+        messages.append({"role": "user", "content": user_input})
+        return messages
+
+    def _build_retrieval_instruction(self, response_mode: str) -> str:
+        grounding_clause = (
+            "Only state specific details, mechanisms, or examples that are explicitly present in the retrieved "
+            "content below; if a detail isn't there, keep your explanation at the level of generality the content "
+            "supports rather than filling the gap from general knowledge. When the retrieved content only "
+            "partially covers the question, prefer omitting the missing part over inferring or generalizing "
+            "past what's written."
+        )
+        if response_mode == "lowest_mpac":
+            return (
+                "You have access to retrieved slides/activities below. Use only slide content that directly "
+                "addresses the user's question. Ignore local activities unless the user explicitly asked for them. "
+                f"{grounding_clause} "
+                "If the content is not helpful, briefly say so before proceeding."
+            )
+        if response_mode == "mpac_question":
+            return (
+                "You have access to retrieved science slides below. Use them to ground your explanation "
+                "of the M-PAC framework or the specific construct the user asked about. "
+                f"Prioritise science content. Ignore local activities. {grounding_clause}"
+            )
+        if response_mode == "home_resources":
+            return (
+                "You have access to retrieved at-home resources below. These are the ONLY resources you should mention — "
+                "do not say you lack resources if they appear in the list. For each suggestion, state its section type "
+                "(Individual Video or Video Playlist), its number, and its name. Do not use the word 'blog'. "
+                f"Do not reference local activities or lesson slides. {grounding_clause}"
+            )
+        if response_mode in {"emotion_education", "educational"}:
+            return (
+                "You have access to retrieved slides/activities below. Use slide content when directly relevant "
+                "for educational support. Ignore local activities unless the user explicitly asked for them. "
+                f"{grounding_clause} "
+                "If the content is not helpful, briefly say so before proceeding."
+            )
+        return (
+            "You have access to retrieved slides/activities below. When relevant, ground your answer in them. "
+            "Respond in a conversational tone using a maximum of three sentences total; no bullet lists or numbered lists. "
+            "If the retrieved context includes local activities, mention relevant options by name with location details — only name activities that appear in the retrieved content, never invent or guess venues. Always add a brief note that schedules can change and they should check Resources or contact the organizer directly before heading out. "
+            "If the user is asking about local activities but no relevant activities appear in the retrieved context, direct them to the What is going on in your area section in Resources — do not suggest or invent venues, community centres, or clubs not present in the retrieved content. "
+            f"{grounding_clause} "
+            "If the content is not helpful, briefly say so before proceeding without it."
+        )
+
+    def _select_reference_source(self, current: Optional[RetrievalResult]) -> Optional[RetrievalResult]:
+        if current and current.master_chunks:
+            return current
+        if self.last_retrieval_with_results and self.last_retrieval_with_results.master_chunks:
+            return self.last_retrieval_with_results
+        return None
+
+    def _select_reference_chunks(
+        self,
+        retrieval: Optional[RetrievalResult],
+        *,
+        max_refs: int,
+        prefer_early_lessons: bool,
+        prefer_science: bool = False,
+        pool_limit: int = REFERENCE_POOL_SIZE,
+    ) -> List[RetrievedChunk]:
+        """
+        Select most relevant lesson chunks for citation.
+
+        When prefer_early_lessons is True (for lowest-MPAC users), prioritizes
+        foundational content (Lessons 1-2) over higher-ranked later lessons,
+        unless the later lesson significantly outscores early content.
+
+        When prefer_science is True, science chunks are sorted to the top of
+        the citation list regardless of score.
+        """
+        if not retrieval or not retrieval.master_chunks or max_refs <= 0:
+            return []
+        chunks = list(retrieval.master_chunks)
+        score_values = [chunk.score for chunk in chunks if chunk.score is not None]
+        use_scores = bool(score_values) and all(0.0 <= score <= 1.0 for score in score_values)
+        if prefer_science:
+            ranked = sorted(
+                chunks,
+                key=lambda c: (0 if c.metadata.get("content_type") == "science" else 1, -(c.score or 0.0)),
+            )
+        elif use_scores:
+            ranked = sorted(chunks, key=lambda chunk: (chunk.score is None, -(chunk.score or 0.0)))
+        else:
+            ranked = chunks
+        ranked = ranked[:pool_limit]
+        if not ranked:
+            return []
+        pool = ranked
+        if prefer_early_lessons:
+            early = [chunk for chunk in pool if (chunk.metadata.get("lesson_number") or 0) <= EARLY_LESSON_MAX]
+            if early:
+                top_is_early = pool[0] in early
+                if top_is_early:
+                    pool = early
+                else:
+                    top = pool[0]
+                    top_score = top.score
+                    early_score = early[0].score
+                    if early_score is not None and top_score is not None and early_score >= top_score - EARLY_LESSON_MARGIN:
+                        pool = early
+
+        return pool[:max_refs]
+
+    @staticmethod
+    def _format_reference_list(chunks: List[RetrievedChunk], *, lesson_level: bool = False) -> List[str]:
+        references: List[str] = []
+        seen = set()
+        for chunk in chunks:
+            ref = chunk.lesson_reference() if lesson_level else chunk.reference()
+            # "Did you know?" is a slide type, not a meaningful title — use lesson-level instead
+            if ref and not lesson_level and "did you know" in ref.lower():
+                ref = chunk.lesson_reference()
+            if ref and ref not in seen:
+                seen.add(ref)
+                references.append(ref)
+        return references
+
+    @staticmethod
+    def _reference_pool_limit(retrieval: Optional[RetrievalResult]) -> int:
+        if retrieval and retrieval.master_chunks:
+            return max(len(retrieval.master_chunks), REFERENCE_POOL_SIZE)
+        return REFERENCE_POOL_SIZE
+
+    @staticmethod
+    def _build_module_reference_instruction(
+        references: List[str],
+        *,
+        max_refs: int,
+        allow: bool,
+    ) -> str:
+        if not allow or max_refs <= 0:
+            return (
+                "Do not mention lesson or slide names. Do not cite or reference the lessons. "
+                "Use any retrieved slide content only as background."
+            )
+        if not references:
+            return (
+                "If the topic relates to a lesson in the reference guide above, add one brief lesson-level sentence "
+                "as a natural closing. Always use the lesson number (e.g., 'You can explore this more in Lesson 4.') — "
+                "do not describe the lesson by its title without the number. "
+                "Do not cite specific page numbers. Do not invent references for topics not covered by the guide."
+            )
+        limited = references[:max_refs]
+        refs_line = "; ".join(limited)
+        return (
+            f"Include a brief lesson reference in your response, using at most {max_refs} from this list: {refs_line}. "
+            "Place it after your main answer but before any closing question you ask. "
+            "Omit it only for one-line conversational replies (e.g. acknowledgements). Do not invent or repeat references."
+        )
+
+    @staticmethod
+    def _build_module_reference_sentence(
+        references: List[str],
+        *,
+        max_refs: int,
+        tone: str = "optional",
+    ) -> str:
+        if not references or max_refs <= 0:
+            return ""
+        limited = references[:max_refs]
+        if len(limited) == 1:
+            return f"You can find more on this in {limited[0]}."
+        refs_line = "; ".join(limited[:-1]) + f" and {limited[-1]}"
+        return f"You can find more on this in {refs_line}."
+
+    @staticmethod
+    def _build_lesson_lookup_response(references: List[str]) -> str:
+        if references:
+            if len(references) == 1:
+                return f"You can find more on this in {references[0]}."
+            refs_line = "; ".join(references[:-1]) + f" and {references[-1]}"
+            return f"You can find more on this in {refs_line}."
+        return "I couldn't find a specific lesson on that in the Reframing Retirement program."
+
+    def _build_weekly_query_response(self, user_input: str) -> str:
+        """Resolve a "what's my focus/goal this week" question with no number given.
+
+        Uses remembered progress (current_lesson/current_week) if known; asks a
+        clarifying question otherwise.
+        """
+        wants_goal = "goal" in user_input.lower()
+        if wants_goal and self.state.current_lesson is not None:
+            return LESSON_GOALS.get(self.state.current_lesson, CLARIFYING_QUESTION)
+        if self.state.current_week is not None:
+            return WEEK_FOCUS.get(self.state.current_week, CLARIFYING_QUESTION)
+        if self.state.current_lesson is not None:
+            return LESSON_GOALS.get(self.state.current_lesson, CLARIFYING_QUESTION)
+        return CLARIFYING_QUESTION
+
+    @staticmethod
+    def _strip_markdown(text: str) -> str:
+        cleaned = text.replace("**", "").replace("__", "")
+        cleaned = re.sub(r"^\s*[-*]\s+", "", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r"^\s*\d+\.\s+", "", cleaned, flags=re.MULTILINE)
+        return cleaned
+
+    @staticmethod
+    def _replace_em_dash(text: str) -> str:
+        text = text.replace("—", "-")
+        replacements = {
+            "behavior": "behaviour",
+            "behaviors": "behaviours",
+            "favorite": "favourite",
+            "favorites": "favourites",
+            "color": "colour",
+            "colors": "colours",
+            "honor": "honour",
+            "honors": "honours",
+            "center": "centre",
+            "centers": "centres",
+            "recognize": "recognise",
+            "recognizes": "recognises",
+        }
+        for american, canadian in replacements.items():
+            text = text.replace(american, canadian)
+            text = text.replace(american.capitalize(), canadian.capitalize())
+        return text
+
+    @staticmethod
+    def _split_sentences(text: str) -> List[str]:
+        return re.split(r"(?<=[.!?])\s+", text.strip())
+
+    def _postprocess_response(
+        self,
+        text: str,
+        *,
+        response_mode: str,
+        module_reference_sentence: str,
+    ) -> str:
+        if response_mode not in {"lowest_mpac", "emotion_education", "educational", "source_request"}:
+            return self._replace_em_dash(text)
+        cleaned = self._replace_em_dash(self._strip_markdown(text))
+        sentences = [sentence.strip() for sentence in self._split_sentences(cleaned) if sentence.strip()]
+        sentences = [sentence for sentence in sentences if "?" not in sentence]
+        if response_mode in {"lowest_mpac", "emotion_education", "educational"}:
+            filtered: List[str] = []
+            for sentence in sentences:
+                lowered = sentence.lower()
+                if any(re.search(pattern, lowered) for pattern in ACTION_SUGGESTION_PATTERNS):
+                    continue
+                filtered.append(sentence)
+            sentences = filtered
+        if module_reference_sentence:
+            sentences = [
+                s for s in sentences
+                if not re.search(r"(you can find|find) more detail|you should check out these lesson|you can find that in these lesson", s, re.IGNORECASE)
+            ]
+        if response_mode == "source_request":
+            max_content = 2
+        else:
+            max_content = 2 if module_reference_sentence else 3
+        content = " ".join(sentences[:max_content]).strip()
+        if module_reference_sentence:
+            if content:
+                return f"{content} {module_reference_sentence}".strip()
+            return module_reference_sentence.strip()
+        return content
+
+    def _maybe_append_mh_disclaimer(self, text: str, user_input: str) -> str:
+        if any(p.search(user_input) for p in _MH_TOPIC_PATTERNS):
+            return f"{text} {_MH_DISCLAIMER}"
+        return text
+
+    def _needs_citations(self, user_input: str) -> bool:
+        return any(pattern.search(user_input) for pattern in SOURCE_REQUEST_PATTERNS)
+
+    def _append_reference_block(self, base_text: str, references: List[str], max_refs: int = 1) -> str:
+        limited = references[:max_refs]
+        if limited:
+            module_block = "\n\n".join(f"- {ref}" for ref in limited)
+            prefix = f"{base_text}\n\n" if base_text else ""
+            return f"{prefix}From your lessons, you can find more detail at:\n{module_block}"
+        fallback_msg = (
+            "I couldn't find a specific slide to cite for that. "
+            "If you can share more detail about what you'd like to know, I can point to a specific lesson."
+        )
+        return f"{base_text}\n\n{fallback_msg}"
+
+    @staticmethod
+    def _filter_lesson_references(references: List[str]) -> List[str]:
+        """Keep only lesson references for citation blocks."""
+
+        return [reference for reference in references if reference.startswith("Lesson ")]
+
+    def _update_state(self, user_input: str) -> None:
+        layer_inference = infer_process_layer(user_input)
+        barrier = infer_barrier(user_input)
+        activities = infer_activities(user_input)
+        time_available = infer_time_available(user_input)
+
+        if layer_inference.layer and layer_inference.confidence >= LAYER_CONFIDENCE_THRESHOLD:
+            self.state.process_layer = layer_inference.layer
+            self.state.layer_confidence = layer_inference.confidence
+            self.state.pending_layer_question = None
+        else:
+            if self.state.process_layer == "unclassified":
+                self.state.layer_confidence = layer_inference.confidence
+                self.state.pending_layer_question = pick_layer_question(layer_inference.signals)
+
+        if layer_inference.signals.has_frequency and not layer_inference.signals.has_timeframe:
+            if self.state.pending_layer_question is None:
+                self.state.pending_layer_question = TIMEFRAME_QUESTION
+        elif layer_inference.signals.has_timeframe and self.state.pending_layer_question == TIMEFRAME_QUESTION:
+            self.state.pending_layer_question = None
+
+        if barrier:
+            self.state.barrier = barrier
+        if activities:
+            self.state.activities = activities
+        if time_available:
+            self.state.time_available = time_available
+
+        stated_lesson, stated_week = extract_stated_lesson_or_week(user_input)
+        if stated_lesson is not None:
+            self.state.current_lesson = stated_lesson
+            self.state.current_week = LESSON_TO_WEEK.get(stated_lesson)
+        elif stated_week is not None:
+            self.state.current_week = stated_week

@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+env/
+venv/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# MacOS
+.DS_Store
+
+# Qdrant local vector store
+qdrant_storage/
+
+# Local devops notes
+devops/
+
+# Local-only docker overrides
+docker-compose.override.yml
+
+# Local-only frontend dev helpers (do not commit)
+frontend/index.dev.html
+frontend/dev-auth.js
+
+# Local-only documentation (AI guides, security docs)
+docs/refs/
+
+# python file for creating flow charts
+_gen_diagrams.py
+
+# Local-only update logs
+updates/
+
+# Local-only project anatomy / overview docs
+anatomy/
+
+# Claude Code local config (hooks, plans, settings)
+.claude/
+
+# Local-only manuscript working notes
+manuscript 1/
+
+# Reviewer notes Excel and supporting scripts
+docs/reviewer_notes_by_theme.xlsx
+scripts/fill_reviewer_notes.py
+
+# Local-only documentation (not public facing)
+docs/systems.md
+docs/tech-stack.md
+
+# Local-only documentation assets (new diagrams, not yet ready to commit)
+docs/assets/chatbot-data-flow.svg
+docs/assets/fastapi.svg
+docs/assets/metadata-capture.svg
+docs/assets/pathverse.png
+docs/assets/qdrant.png
+docs/assets/retrieval-pipeline.svg
+docs/assets/system-architecture.svg
+note-changes-updates/

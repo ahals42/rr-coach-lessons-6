@@ -1,0 +1,230 @@
+"""FastAPI backend that exposes the coach over HTTP with streaming responses."""
+
+from __future__ import annotations
+
+import json
+import os
+import logging
+import time
+from typing import Iterator
+
+from dotenv import load_dotenv
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from openai import OpenAI
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
+from config.app_config import RATE_LIMIT_HEALTHZ_PER_MINUTE, SESSION_TTL_MINUTES, STREAMING_TIMEOUT_SECONDS
+from coach import CoachAgent, run_rag_sanity_check
+from rag.config import load_rag_config, DATA_DIR, MASTER_FILENAME
+from rag.parsing_master import parse_lesson_overviews
+from rag.retriever import RagRetriever
+from rag.router import QueryRouter
+
+from .models import DeleteSessionResponse, MessageRequest, SessionCreateResponse
+from .session_store import InMemorySessionStore
+from .voice.routes import create_voice_router
+from .middleware.auth import require_api_key
+from .middleware.rate_limit import limiter, RATE_LIMITS
+
+# Configure logging
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+config = load_rag_config()
+client = OpenAI(api_key=config.openai_api_key)
+
+retriever = None
+try:
+    retriever = RagRetriever(config)
+    run_rag_sanity_check(retriever)
+except (RuntimeError, ConnectionError, OSError) as exc:
+    logger.warning(f"RAG initialization failed: {exc}. Continuing without vector context.")
+
+# Load lesson overviews once at startup — shared across all sessions
+_lesson_overviews = {}
+try:
+    _data_path = retriever.config.master_data_path if retriever is not None else DATA_DIR / MASTER_FILENAME
+    _lesson_overviews = parse_lesson_overviews(_data_path)
+    logger.info(f"Lesson overviews loaded at startup: {len(_lesson_overviews)} lessons")
+except (OSError, ValueError) as exc:
+    logger.warning(f"Failed to load lesson overviews at startup: {exc}")
+
+
+def _agent_factory() -> CoachAgent:
+    return CoachAgent(client=client, model=config.chat_model, retriever=retriever, router=QueryRouter(), lesson_overviews=_lesson_overviews)
+
+
+session_store = InMemorySessionStore(_agent_factory, ttl_minutes=SESSION_TTL_MINUTES)
+
+app = FastAPI(title="Reframing Retirement Coach API (Lessons 1-6)", version="0.1.0")
+
+# Configure rate limiter
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Configure CORS with restricted origins
+allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000")
+allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",") if origin.strip()]
+
+logger.info(f"CORS allowed origins: {allowed_origins}")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,  # Restricted origins from environment
+    allow_credentials=False,  # No credentials with specific origins
+    allow_methods=["GET", "POST", "DELETE"],  # Only needed methods
+    allow_headers=["Content-Type", "X-API-Key", "Authorization"],  # Only needed headers
+)
+
+# Include voice routes with authentication
+app.include_router(create_voice_router(session_store, client))
+
+logger.info("Application initialized successfully")
+
+
+@app.get("/healthz")
+@limiter.limit(f"{RATE_LIMIT_HEALTHZ_PER_MINUTE}/minute")
+async def health_check(request: Request) -> dict:
+    """
+    Health check endpoint (no authentication required for Docker healthcheck).
+    Returns basic application status.
+    """
+    return {
+        "status": "ok",
+        "service": "reframing-retirement-coach",
+        "version": "0.1.0",
+        "rag_enabled": retriever is not None
+    }
+
+
+@app.post("/sessions", response_model=SessionCreateResponse)
+@require_api_key
+@limiter.limit(f"{RATE_LIMITS['session_creation_per_hour']}/hour")
+async def create_session(request: Request) -> SessionCreateResponse:
+    """
+    Create a new anonymous coaching session.
+    Requires API key authentication.
+    Rate limited per API key.
+    """
+    try:
+        # Pass API key hash to session store for tracking
+        api_key_hash = request.state.api_key[:8] if request.state.api_key else None
+        session_id = session_store.create(api_key_hash=api_key_hash)
+        logger.info(f"Created session {session_id} for API key {api_key_hash}...")
+        return SessionCreateResponse(session_id=session_id)
+    except RuntimeError as exc:
+        # Session limit exceeded
+        logger.warning(f"Session creation failed (limit exceeded): {exc}")
+        raise HTTPException(status_code=429, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"Failed to create session: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to create session")
+
+
+@app.delete("/sessions/{session_id}", response_model=DeleteSessionResponse)
+@require_api_key
+async def delete_session(request: Request, session_id: str) -> DeleteSessionResponse:
+    """
+    Delete a coaching session.
+    Requires API key authentication.
+    """
+    try:
+        session_store.delete(session_id)
+        logger.info(f"Deleted session {session_id} for API key {request.state.api_key[:8]}...")
+        return DeleteSessionResponse(message="Session cleared")
+    except Exception as exc:
+        logger.error(f"Failed to delete session {session_id}: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to delete session")
+
+
+@app.post("/sessions/{session_id}/messages")
+@require_api_key
+@limiter.limit(f"{RATE_LIMITS['messages_per_hour']}/hour")
+async def stream_message(request: Request, session_id: str, payload: MessageRequest) -> StreamingResponse:
+    """
+    Stream coaching response for a message.
+    Requires API key authentication.
+    Rate limited per API key.
+    """
+    record = session_store.get(session_id)
+    if not record:
+        logger.warning(f"Session {session_id} not found")
+        raise HTTPException(status_code=404, detail="Unknown session")
+
+    # Log message request (without sensitive content)
+    logger.info(
+        f"Message request for session {session_id} "
+        f"from API key {request.state.api_key[:8]}... "
+        f"(length: {len(payload.text)} chars)"
+    )
+
+    def event_stream() -> Iterator[str]:
+        stream = record.agent.stream_response(payload.text)
+        final_reply = ""
+        deadline = time.monotonic() + STREAMING_TIMEOUT_SECONDS
+        try:
+            while True:
+                if time.monotonic() > deadline:
+                    logger.error(f"Streaming timeout ({STREAMING_TIMEOUT_SECONDS}s) for session {session_id}")
+                    yield _as_event("error", {"error": "Response timed out"})
+                    return
+                chunk = next(stream)
+                if not chunk:
+                    continue
+                yield _as_event("token", {"text": chunk})
+        except StopIteration as stop:
+            final_reply = stop.value or ""
+        except Exception as exc:
+            logger.error(f"Error during streaming for session {session_id}: {exc}")
+            yield _as_event("error", {"error": "An error occurred during response generation"})
+            return
+
+        state = record.agent.snapshot()
+        retrieved_context = ""
+        if record.agent.latest_retrieval is not None:
+            try:
+                retrieved_context = record.agent.latest_retrieval.build_prompt_context()
+            except Exception as ctx_exc:
+                logger.warning(f"Failed to serialize retrieved context for session {session_id}: {ctx_exc}")
+        yield _as_event("done", {"text": final_reply, "state": state, "retrieved_context": retrieved_context})
+
+        logger.info(f"Completed message stream for session {session_id}")
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+def _as_event(event_type: str, payload: dict) -> str:
+    payload = {"type": event_type, **payload}
+    return json.dumps(payload) + "\n"
+
+
+# Serve frontend static files
+# Determine frontend path (works both locally and in Docker)
+frontend_path = Path(__file__).parent.parent / "frontend"
+if frontend_path.exists():
+    # Serve static files (CSS, JS, images)
+    app.mount("/static", StaticFiles(directory=frontend_path), name="static")
+
+    @app.get("/")
+    async def serve_index():
+        """Serve the main frontend page."""
+        return FileResponse(frontend_path / "index.html")
+
+    @app.get("/{filename:path}")
+    async def serve_static(filename: str):
+        """Serve static files from frontend directory."""
+        file_path = frontend_path / filename
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(file_path)
+        # Return index.html for SPA routing
+        return FileResponse(frontend_path / "index.html")

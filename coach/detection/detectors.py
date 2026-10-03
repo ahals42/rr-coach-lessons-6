@@ -1,0 +1,152 @@
+"""Detection functions for user intent and emotional state."""
+
+import re
+from typing import Optional
+
+from .text_match import _contains_patterns, _contains_keywords
+from ..inference import (
+    LOWEST_MPAC_STRONG_PATTERNS,
+    LOWEST_MPAC_ACTIVITY_PATTERNS,
+    GENERAL_DISINTEREST_PATTERNS,
+    EMOTION_STRONG_PATTERNS,
+    EMOTION_WEAK_PATTERNS,
+    MODULE_REQUEST_PATTERNS,
+    LESSON_LOOKUP_PATTERNS,
+    EDUCATIONAL_REQUEST_PATTERNS,
+    MPAC_QUESTION_PATTERNS,
+    SOURCE_REQUEST_PATTERNS,
+    TECHNICAL_SUPPORT_PATTERNS,
+    CHATBOT_HELP_PATTERNS,
+    extract_lesson_number,
+    extract_lesson_goal_number,
+    extract_week_focus_number,
+    is_generic_weekly_query,
+    extract_bare_lesson_statement,
+    extract_bare_week_statement,
+    extract_bare_number,
+)
+from ..constants import ACTIVITY_CONTEXT_KEYWORDS
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from rag.router import RouteDecision
+
+
+def detect_lowest_mpac(text: str) -> bool:
+    """Detect if user expresses lowest M-PAC (unmotivated/disengaged language)."""
+    lowered = text.lower()
+    if _contains_patterns(lowered, LOWEST_MPAC_STRONG_PATTERNS):
+        return True
+    if _contains_patterns(lowered, LOWEST_MPAC_ACTIVITY_PATTERNS):
+        return True
+    return False
+
+
+def detect_general_disinterest(text: str) -> bool:
+    """Detect if user expresses general disinterest in physical activity."""
+    lowered = text.lower()
+    if "?" in lowered:
+        return False
+    return _contains_patterns(lowered, GENERAL_DISINTEREST_PATTERNS)
+
+
+def detect_emotion_regulation(text: str) -> bool:
+    """Detect if user expresses negative emotions about physical activity."""
+    lowered = text.lower()
+    if _contains_patterns(lowered, EMOTION_STRONG_PATTERNS):
+        return True
+    if _contains_patterns(lowered, EMOTION_WEAK_PATTERNS) and _contains_keywords(lowered, ACTIVITY_CONTEXT_KEYWORDS):
+        return True
+    return False
+
+
+def detect_module_request(text: str) -> bool:
+    """Detect if user is asking about module/lesson content."""
+    lowered = text.lower()
+    return _contains_patterns(lowered, MODULE_REQUEST_PATTERNS)
+
+
+def detect_lesson_lookup(text: str) -> bool:
+    """Detect if user is asking which lesson covers a topic."""
+    lowered = text.lower()
+    return _contains_patterns(lowered, LESSON_LOOKUP_PATTERNS)
+
+
+def detect_educational_use_case(text: str, *, explicit_module_request: bool, decision: Optional["RouteDecision"]) -> bool:
+    """Detect if user is asking educational questions about physical activity."""
+    if explicit_module_request:
+        return True
+    lowered = text.lower()
+    # Educational pattern match takes priority over the use_activities guard.
+    # Generic words like "activity" appear in both self-monitoring and discovery queries,
+    # so the pattern match is a stronger signal than the keyword flag alone.
+    if _contains_patterns(lowered, EDUCATIONAL_REQUEST_PATTERNS):
+        return True
+    if decision and decision.use_activities:
+        return False
+    if decision and decision.prefer_science:
+        return True
+    return False
+
+
+def detect_mpac_question(text: str) -> bool:
+    """Detect if user is explicitly asking about the M-PAC framework or its named constructs."""
+    lowered = text.lower()
+    return _contains_patterns(lowered, MPAC_QUESTION_PATTERNS)
+
+
+def detect_lesson_overview_request(text: str) -> Optional[int]:
+    """Return the lesson number if user is asking for an overview of a specific lesson."""
+    return extract_lesson_number(text)
+
+
+def detect_lesson_goal_request(text: str) -> Optional[int]:
+    """Return the lesson number if user is asking for that lesson's goal/task."""
+    return extract_lesson_goal_number(text)
+
+
+def detect_week_focus_request(text: str) -> Optional[int]:
+    """Return the week number if user is asking for that week's focus."""
+    return extract_week_focus_number(text)
+
+
+def detect_generic_weekly_query(text: str) -> bool:
+    """Detect a "what's my focus/goal this week" question with no lesson/week number given."""
+    return is_generic_weekly_query(text)
+
+
+def detect_bare_lesson_statement(text: str) -> Optional[int]:
+    """Return the lesson number if the whole message is just a "lesson N" statement."""
+    return extract_bare_lesson_statement(text)
+
+
+def detect_bare_week_statement(text: str) -> Optional[int]:
+    """Return the week number if the whole message is just a "week N" statement."""
+    return extract_bare_week_statement(text)
+
+
+def detect_bare_number_reply(text: str) -> Optional[int]:
+    """Return the number if the whole message is just a bare 1-2 digit number."""
+    return extract_bare_number(text)
+
+
+def detect_technical_support_request(text: str) -> bool:
+    """Detect if user is asking a technical support question about the app or devices."""
+    return _contains_patterns(text, TECHNICAL_SUPPORT_PATTERNS)
+
+
+def detect_chatbot_help_request(text: str) -> bool:
+    """Detect if user is asking what the chatbot can do or how to use it."""
+    return _contains_patterns(text, CHATBOT_HELP_PATTERNS)
+
+
+def detect_sources_only(text: str) -> bool:
+    """Detect if user is only asking for sources/references."""
+    lowered = text.lower()
+    if not any(pattern.search(lowered) for pattern in SOURCE_REQUEST_PATTERNS):
+        return False
+    cleaned = lowered
+    for pattern in SOURCE_REQUEST_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned).strip()
+    return len(cleaned.split()) <= 2

@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reframing Retirement Coach: Lessons 1-6</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+
+  <body>
+    <main class="app-shell">
+      <header class="hero">
+        <div class="hero__brand">
+          <h1>Reframing Retirement Coach: Lessons 1-6</h1>
+        </div>
+
+        <div
+          class="hero__disclaimer"
+          role="note"
+          aria-label="Coach scope and limitations"
+        >
+          <p>
+            <strong>What It Is:</strong>
+            A supplementary support tool for use by Reframing Retirement participants.
+            It provides M-PAC aligned physical activity behaviour change support to recently
+            retired adults. Responses are grounded in Reframing Retirement lesson material.
+            This version is for users who only have access to lessons 1-6 content.
+          </p>
+
+          <p>
+            <strong>What It Is Not:</strong>
+            It is not intended to replace a healthcare professional or other qualified support. It does not provide medical or mental health advice, diagnoses, or risk assessments. For medical, mental health, or urgent concerns, please contact a qualified healthcare professional or your local emergency services.
+          </p>
+        </div>
+      </header>
+
+      <section
+        id="chat"
+        class="chat-window"
+        aria-live="polite"
+      ></section>
+
+      <form
+        id="chat-form"
+        class="chat-form"
+        autocomplete="off"
+      >
+        <button
+          id="mic-button"
+          class="mic-button"
+          type="button"
+          aria-pressed="false"
+          aria-labelledby="mic-label"
+        >
+          <img
+            src="MicrophonePhoto.png"
+            class="mic-icon"
+            alt=""
+            aria-hidden="true"
+          />
+          <span
+            id="mic-label"
+            class="sr-only"
+          >
+            Hold to talk
+          </span>
+        </button>
+        <input
+          id="message-input"
+          type="text"
+          name="message"
+          placeholder="Type a message..."
+          required
+        />
+        <button
+          type="submit"
+          class="send-button"
+          aria-label="Send message"
+        >
+          <img
+            src="SendButton.png"
+            class="send-icon"
+            alt=""
+            aria-hidden="true"
+          />
+          <span class="sr-only">Send</span>
+        </button>
+      </form>
+
+      <button
+        id="reset-session"
+        class="reset-button"
+        type="button"
+        aria-label="Start fresh"
+      >
+        <img
+          src="RefreshPhoto.png"
+          class="reset-icon"
+          alt=""
+          aria-hidden="true"
+        />
+        <span class="sr-only">Start fresh</span>
+      </button>
+    </main>
+
+    <script>
+      window.API_BASE_URL = "";
+    </script>
+
+    <script src="app.js" type="module"></script>
+  </body>
+</html>

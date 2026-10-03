@@ -1,0 +1,730 @@
+"""Pattern definitions and layer inference functions."""
+
+import re
+from typing import List, Optional, Pattern
+
+from .detection.text_match import _contains_patterns, _contains_keywords
+from .state import LayerSignals, LayerInference
+from .constants import (
+    ROUTINE_KEYWORDS,
+    PLANNING_KEYWORDS,
+    NOT_STARTED_KEYWORDS,
+    AFFECTIVE_KEYWORDS,
+    OPPORTUNITY_KEYWORDS,
+    FREQUENCY_QUESTION,
+    ROUTINE_QUESTION,
+    TIMEFRAME_QUESTION,
+)
+
+# Compiled regex patterns for better performance
+# These patterns detect behavioral signals and user intent
+
+FREQUENCY_PATTERNS: List[Pattern] = [
+    re.compile(r"\b\d+\s*(?:x|times?)\s*(?:each|per|a|this)?\s*(?:day|week|month)\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s*(?:days?)\s*(?:each|per|a)\s+week\b", re.IGNORECASE),
+    re.compile(r"\b(?:daily|every day|each day|every morning|every evening)\b", re.IGNORECASE),
+    re.compile(r"\b(?:once|twice|thrice)\s*(?:each|per|a|this|these|last)?\s*(?:week|day)\b", re.IGNORECASE),
+    re.compile(r"\b(?:one|two|three|four|five|six|seven)\s+times?\s*(?:each|per|a|this|these|last)?\s*(?:week|day|month)\b", re.IGNORECASE),
+]
+
+TIMEFRAME_PATTERNS: List[Pattern] = [
+    re.compile(r"\bfor\s+\d+\s+(?:weeks?|months?|years?)\b", re.IGNORECASE),
+    re.compile(r"\bfor\s+(?:weeks|months|years)\b", re.IGNORECASE),
+    re.compile(r"\bsince\s+\w+\b", re.IGNORECASE),
+    re.compile(r"\bover\s+the\s+last\s+\d+\s+(?:weeks?|months?|years?)\b", re.IGNORECASE),
+]
+
+SOURCE_REQUEST_PATTERNS: List[Pattern] = [
+    re.compile(r"\bsource(s)?\b", flags=re.IGNORECASE),
+    re.compile(r"\breference(s)?\b", flags=re.IGNORECASE),
+    re.compile(r"\bcitation(s)?\b", flags=re.IGNORECASE),
+    re.compile(r"\bslides?\b", flags=re.IGNORECASE),
+    re.compile(r"where did that come from", flags=re.IGNORECASE),
+    re.compile(r"where (?:is|does) that come from", flags=re.IGNORECASE),
+    re.compile(r"where can i find that", flags=re.IGNORECASE),
+    re.compile(r"which (?:lesson|module)", flags=re.IGNORECASE),
+    re.compile(r"what (?:lesson|module)", flags=re.IGNORECASE),
+    re.compile(r"show sources?", flags=re.IGNORECASE),
+    re.compile(r"where can i read more", flags=re.IGNORECASE),
+    re.compile(r"where can i find this", flags=re.IGNORECASE),
+    re.compile(r"where in my app", flags=re.IGNORECASE),
+    re.compile(r"show me where", flags=re.IGNORECASE),
+]
+
+# Patterns for detecting lowest M-PAC (unmotivated/disengaged language)
+LOWEST_MPAC_STRONG_PATTERNS: List[Pattern] = [
+    re.compile(r"\bwhy bother\b", re.IGNORECASE),
+    re.compile(r"\bwhat'?s the point\b", re.IGNORECASE),
+    re.compile(r"\bwhat'?s the use\b", re.IGNORECASE),
+    re.compile(r"\bno point\b", re.IGNORECASE),
+    re.compile(r"\bpointless\b", re.IGNORECASE),
+    re.compile(r"\bnot worth (?:it|the effort)\b", re.IGNORECASE),
+    re.compile(r"\btoo late for me\b", re.IGNORECASE),
+]
+
+LOWEST_MPAC_ACTIVITY_PATTERNS: List[Pattern] = [
+    re.compile(r"\b(can't|cannot) be bothered\b.*\b(exercise|physical activity|being active|move|movement)\b", re.IGNORECASE),
+    re.compile(r"\bno intention\b.*\b(exercise|physical activity|being active|move|movement)\b", re.IGNORECASE),
+    re.compile(r"\bnot interested\b.*\b(exercise|physical activity|being active|move|movement)\b", re.IGNORECASE),
+    re.compile(r"\b(don'?t|do not)\s+want\s+to\s+be\s+active\b", re.IGNORECASE),
+    re.compile(r"\b(don'?t|do not)\s+want\s+to\s+exercise\b", re.IGNORECASE),
+    re.compile(r"\b(don'?t|do not)\s+want\s+to\s+move\b", re.IGNORECASE),
+    re.compile(r"\bnever going to\b.*\b(exercise|physical activity|being active|move|movement|start)\b", re.IGNORECASE),
+    re.compile(r"\bwon't ever\b.*\b(exercise|physical activity|being active|move|movement|start)\b", re.IGNORECASE),
+    re.compile(r"\bnot going to\b.*\b(exercise|physical activity|being active|move|movement|start)\b", re.IGNORECASE),
+]
+
+GENERAL_DISINTEREST_PATTERNS: List[Pattern] = [
+    re.compile(r"\bi\s+don'?t\s+want\s+to\s+be\s+active\b", re.IGNORECASE),
+    re.compile(r"\bi\s+don'?t\s+want\s+to\s+exercise\b", re.IGNORECASE),
+    re.compile(r"\bi\s+don'?t\s+want\s+to\s+move\b", re.IGNORECASE),
+    re.compile(r"\bnot\s+interested\s+in\s+being\s+active\b", re.IGNORECASE),
+    re.compile(r"\bnot\s+interested\s+in\s+physical\s+activity\b", re.IGNORECASE),
+    re.compile(r"\bnot\s+interested\s+in\s+exercise\b", re.IGNORECASE),
+    re.compile(r"\bnever(?:ing)?\s+going\s+to\s+be\s+active\b", re.IGNORECASE),
+    re.compile(r"\bwon'?t\s+ever\s+be\s+active\b", re.IGNORECASE),
+    re.compile(r"\bwon'?t\s+ever\s+exercise\b", re.IGNORECASE),
+    re.compile(r"\b(no\s+point|pointless|waste\s+of\s+time|not\s+worth\s+it|won'?t\s+help|nothing\s+will\s+change)\b", re.IGNORECASE),
+    re.compile(r"\b(physical\s+active|physical\s+activity|being\s+active|exercise)\s+is\s+pointles\b", re.IGNORECASE),
+    re.compile(r"\b(physical\s+activity|being\s+active|exercise)\s+seems\s+worthless\b", re.IGNORECASE),
+    re.compile(r"\bpointles\s+to\s+(exercise|be\s+active|try)\b", re.IGNORECASE),
+    re.compile(r"\bi\s+just\s+don'?t\s+have\s+it\s+in\s+me\b", re.IGNORECASE),
+    re.compile(r"\bi'?m\s+done\s+trying\b", re.IGNORECASE),
+    re.compile(r"\bi\s+can'?t\s+be\s+bothered\b", re.IGNORECASE),
+    re.compile(r"\bi'?m\s+checked\s+out\b", re.IGNORECASE),
+    re.compile(r"\btoo\s+old\s+to\s+(exercise|start)\b", re.IGNORECASE),
+    re.compile(r"\bmy\s+body\s+can'?t\s+do\s+that\s+anymore\b", re.IGNORECASE),
+    re.compile(r"\bthat\s+ship\s+has\s+sailed\b", re.IGNORECASE),
+    re.compile(r"\bit'?s\s+too\s+late\s+for\s+me\b", re.IGNORECASE),
+    re.compile(r"\bnothing\s+will\s+change\b", re.IGNORECASE),
+    re.compile(r"\bit\s+won'?t\s+help\s+anyway\b", re.IGNORECASE),
+    re.compile(r"\bi'?ll\s+never\s+stick\s+with\s+it\b", re.IGNORECASE),
+    re.compile(r"\bi\s+always\s+quit\b", re.IGNORECASE),
+    re.compile(r"\bi\s+can'?t\s+keep\s+it\s+up\b", re.IGNORECASE),
+    re.compile(r"\b(worthless|useless)\s+(to|trying\s+to)?\s*(exercise|be\s+active)\b", re.IGNORECASE),
+    re.compile(r"\bexercise\s+is\s+(useless|worthless)\b", re.IGNORECASE),
+    re.compile(r"\b(waste|wasting)\s+of\s+time\b", re.IGNORECASE),
+    re.compile(r"\bnot\s+worth\s+the\s+effort\b", re.IGNORECASE),
+    re.compile(r"\bno\s+point\s+(in|to)\s+(exercise|being\s+active|trying)\b", re.IGNORECASE),
+    re.compile(r"\bwhat'?s\s+the\s+point\s+of\s+(exercise|being\s+active)\b", re.IGNORECASE),
+    re.compile(r"\bpointless\s+to\s+(exercise|try|be\s+active)\b", re.IGNORECASE),
+    re.compile(r"\bit\s+won'?t\s+make\s+a\s+difference\b", re.IGNORECASE),
+    re.compile(r"\bdoesn'?t\s+matter\s+if\s+i\s+exercise\b", re.IGNORECASE),
+]
+
+# Patterns for detecting educational queries and user intent
+EDUCATIONAL_REQUEST_PATTERNS: List[Pattern] = [
+    re.compile(r"\bwhy (?:is|does)\b.*\b(physical activity|exercise|movement|being active)\b", re.IGNORECASE),
+    re.compile(r"\bwhat is\b.*\b(physical activity|exercise|movement|being active)\b", re.IGNORECASE),
+    re.compile(r"\bbenefits?\b.*\b(physical activity|exercise|movement|being active)\b", re.IGNORECASE),
+    re.compile(r"\bhealth benefits?\b", re.IGNORECASE),
+    re.compile(r"\bhow does\b.*\b(physical activity|exercise|movement|being active)\b", re.IGNORECASE),
+    re.compile(r"\bexplain\b.*\b(physical activity|exercise|movement|being active)\b", re.IGNORECASE),
+    re.compile(r"\bhelp me understand\b.*\b(physical activity|exercise|movement|being active)\b", re.IGNORECASE),
+    re.compile(r"\bwhat happens if\b.*\b(not active|inactive|sedentary)\b", re.IGNORECASE),
+    re.compile(r"\bevidence\b.*\b(physical activity|exercises?|movement|being active)\b", re.IGNORECASE),
+    re.compile(r"\bresearch\b.*\b(physical activity|exercises?|movement|being active)\b", re.IGNORECASE),
+    # "What does research/science say about X" — catches plural forms and strength/exercise combinations.
+    re.compile(r"\bwhat\s+does\s+(?:research|science|evidence)\s+say\b", re.IGNORECASE),
+    re.compile(r"\btell me about\b.*\b(physical activity|exercise|movement|being active)\b", re.IGNORECASE),
+    # Term-definition queries: catch "What does X mean?", "Define X", "What is an asymptotic curve?"
+    # These do not require activity anchor words because lesson terminology can come from any field.
+    re.compile(r"\bwhat\s+does\b.{1,60}\bmean\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+do\b.{1,60}\bmean\b", re.IGNORECASE),
+    re.compile(r"\bdefine\b", re.IGNORECASE),
+    re.compile(r"\bhow\s+(?:is|are)\b.{1,50}\bdefined?\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+(?:is|are)\s+(?:an?\s+)?(?:asymptotic|valence|arousal|dose.response|transtheoretical|affective|instrumental|hedonic|eudemon|intrinsic|extrinsic|autonomous|self.determin|allostatic)\b", re.IGNORECASE),
+    # Habit and goal questions - core M-PAC coaching constructs that may lack activity anchor words.
+    re.compile(r"\bhow\s+do\s+habits?\s+work\b", re.IGNORECASE),
+    re.compile(r"\b(?:build|form|make|create)\s+(?:good\s+)?habits?\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+(?:makes|is)\s+a\s+(?:good\s+)?(?:behaviou?ral\s+)?goal\b", re.IGNORECASE),
+    re.compile(r"\bbehaviou?ral\s+goal\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+helps?\s+(?:people\s+)?build\s+(?:good\s+)?habits?\b", re.IGNORECASE),
+    re.compile(r"\bdifference\s+between\s+(?:a\s+)?(?:habit|value)\b", re.IGNORECASE),
+    re.compile(r"\bvalues?\s+and\s+identity\b", re.IGNORECASE),
+    re.compile(r"\bidentity\s+and\s+values?\b", re.IGNORECASE),
+    # Self-talk and breathing - reactive regulation strategies, no activity anchor needed.
+    re.compile(r"\bself.talk\b", re.IGNORECASE),
+    re.compile(r"\bpositive\s+self.talk\b", re.IGNORECASE),
+    re.compile(r"\bbreathing\s+exercise\b", re.IGNORECASE),
+    # Emotion self-regulation - reactive regulation is a core M-PAC construct.
+    # Without activity anchor words these can be mistaken for mental health / therapy requests.
+    re.compile(r"\b(?:manage|control|regulate)\s+my\s+emotions?\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+can\s+i\s+(?:do|say)\s+(?:to|when)\b.{0,40}\b(?:emotions?|mood|feel)\b", re.IGNORECASE),
+    # Habit cues - habit formation vocabulary without an activity anchor word.
+    re.compile(r"\b(?:why\s+do|how\s+do|what\s+makes)\s+(?:a\s+)?cues?\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+(?:is|makes)\s+a\s+good\s+cue\b", re.IGNORECASE),
+    # Habit longevity - timeline and durability questions that lack activity anchor words.
+    re.compile(r"\bhow\s+long\b.{0,50}\bhabit\b", re.IGNORECASE),
+    re.compile(r"\bhabit\b.{0,40}\b(?:last|stick|going|strong|break|fade)\b", re.IGNORECASE),
+    re.compile(r"\bfall\s+(?:out\s+of|off)\b.{0,30}\bhabit\b", re.IGNORECASE),
+    # Self-monitoring - tracking questions that lack explicit activity anchor words.
+    # "activities" (plural) is excluded from the track pattern — plural almost always signals discovery intent.
+    re.compile(r"\bself.monitor(?:ing)?\b", re.IGNORECASE),
+    re.compile(r"\btrack\b.{0,50}\b(?:activity|exercise|movement|steps|progress)\b", re.IGNORECASE),
+    re.compile(r"\bkeep\s+(?:tabs|track)\b", re.IGNORECASE),
+    # Intention-behaviour gap - named construct without activity anchor word.
+    re.compile(r"\bintention.behavi(?:ou?r)\b", re.IGNORECASE),
+    # Identity (explanatory framing) - "see myself as active" questions.
+    # Personal coaching moments ("become an active person", "will I fit in") are excluded.
+    re.compile(r"\bsee(?:ing)?\s+(?:my)?self\s+as\b.{0,40}\bactive\b", re.IGNORECASE),
+    # Capability (factual framing) - population-level questions about older adults.
+    # Personal coaching moments ("is it realistic for me", "can I trust my limits") are excluded.
+    re.compile(r"\bcan\s+older\s+adults?\b", re.IGNORECASE),
+    re.compile(r"\btoo\s+old\s+to\b", re.IGNORECASE),
+    re.compile(r"\b(?:safe|okay|ok)\s+for\s+older\s+adults?\b", re.IGNORECASE),
+    # Reactive regulation gap - phrasing variant not caught by existing self-talk patterns.
+    re.compile(r"\bwhat\s+(?:should|can)\s+i\s+say\s+to\s+(?:my)?self\b", re.IGNORECASE),
+    # Mood and cognitive benefits - Lesson 2 questions that use "will/does/can" rather than "why does/is".
+    re.compile(r"\b(?:will|does|can|would)\s+(?:exercise|physical\s+activity|movement|being\s+active)\b.{0,50}\b(?:mood|concentration|memory|brain|mental|feel\s+better|think\s+(?:clearer|sharper|better))\b", re.IGNORECASE),
+    re.compile(r"\b(?:mood|concentration|memory|cognitive)\b.{0,40}\b(?:exercise|physical\s+activity|movement|being\s+active)\b", re.IGNORECASE),
+    # Habit automaticity - "make X more automatic" lacks a habit anchor word caught by existing patterns.
+    re.compile(r"\b(?:automatic|automaticity)\b.{0,40}\b(?:exercise|activity|movement|habit)\b", re.IGNORECASE),
+    re.compile(r"\b(?:exercise|activity|movement)\b.{0,40}\bautomatic\b", re.IGNORECASE),
+    # Social monitoring and ACT evidence - Lessons 4-6 and 7-10 research constructs.
+    re.compile(r"\bsocial\s+monitor(?:ing)?\b", re.IGNORECASE),
+    re.compile(r"\bself.reported\s+habit\s+index\b", re.IGNORECASE),
+    # ACT (Acceptance and Commitment Therapy) - compiled without IGNORECASE to avoid matching
+    # the common word "act". Full name also caught case-insensitively.
+    re.compile(r"\b(?:evidence|research|support)\b.{0,60}\bACT\b"),
+    re.compile(r"\bacceptance\s+and\s+commitment\b", re.IGNORECASE),
+]
+
+# Patterns for detecting explicit MPAC framework questions
+MPAC_QUESTION_PATTERNS: List[Pattern] = [
+    # Direct acronym/name
+    re.compile(r"\bM-?PAC\b", re.IGNORECASE),
+    re.compile(r"\bmulti[\s-]?process\s+action\s+control\b", re.IGNORECASE),
+
+    # Initiating reflective constructs
+    re.compile(r"\bperceived\s+capabilit(?:y|ies)\b", re.IGNORECASE),
+    re.compile(r"\binstrumental\s+(?:attitude|belief|beliefs)\b", re.IGNORECASE),
+
+    # Ongoing reflective constructs
+    re.compile(r"\baffective\s+(?:judgment|judgement|attitude|appraisal|belief|beliefs)\b", re.IGNORECASE),
+    re.compile(r"\bperceived\s+opportunit(?:y|ies)\b", re.IGNORECASE),
+
+    # Regulatory constructs
+    re.compile(r"\bregulatory\s+(?:phase|control|process)\b", re.IGNORECASE),
+    re.compile(r"\bcognitive\s+regulation\b", re.IGNORECASE),
+    re.compile(r"\bemotional\s+regulation\b.{0,60}\b(?:mpac|model|framework|phase|layer)\b", re.IGNORECASE),
+
+    # Reflexive constructs — anchored to avoid false matches in normal conversation
+    re.compile(r"\breflexive\s+(?:layer|phase|process|habit)\b", re.IGNORECASE),
+    re.compile(r"\bidentity[\s-]based\s+(?:habit|motivation|behavior|behaviour)\b", re.IGNORECASE),
+
+    # Initiating/ongoing reflective layer names
+    re.compile(r"\b(?:initiating|ongoing)\s+reflective\b", re.IGNORECASE),
+    re.compile(r"\breflective\s+(?:layer|phase|process|stage)\b", re.IGNORECASE),
+
+    # "What is/explain the behaviour change model/framework"
+    re.compile(r"\b(?:explain|describe|tell me about|what is|how does)\b.{0,50}\b(?:behavior change model|behaviour change model|action control model|action control framework)\b", re.IGNORECASE),
+]
+
+MODULE_REQUEST_PATTERNS: List[Pattern] = [
+    re.compile(r"\bmodule\b", re.IGNORECASE),
+    re.compile(r"\blesson\s+\d+\b", re.IGNORECASE),
+    re.compile(r"\bslide\s+\d+\b", re.IGNORECASE),
+    re.compile(r"\bwhat does (?:the )?module say\b", re.IGNORECASE),
+    re.compile(r"\bwhat does (?:the )?lesson say\b", re.IGNORECASE),
+    re.compile(r"\bwhat does (?:the )?slide say\b", re.IGNORECASE),
+]
+
+LESSON_LOOKUP_PATTERNS: List[Pattern] = [
+    re.compile(r"\bwhich lesson\b", re.IGNORECASE),
+    re.compile(r"\bwhat lesson\b", re.IGNORECASE),
+    re.compile(r"\bwhere in (?:the )?module\b", re.IGNORECASE),
+    re.compile(r"\bwhere in (?:the )?lesson\b", re.IGNORECASE),
+]
+
+# Patterns to detect "tell me about lesson X" style overview requests.
+# Each pattern must have a named group 'num' capturing the lesson number.
+LESSON_OVERVIEW_PATTERNS: List[Pattern] = [
+    re.compile(r"\btell me about lesson\s+(?P<num>\d+)\b", re.IGNORECASE),
+    re.compile(r"\bwhat(?:'?s|\s+is)\s+lesson\s+(?P<num>\d+)\b", re.IGNORECASE),
+    re.compile(r"\bexplain lesson\s+(?P<num>\d+)\b", re.IGNORECASE),
+    re.compile(r"\bdescribe lesson\s+(?P<num>\d+)\b", re.IGNORECASE),
+    re.compile(r"\babout lesson\s+(?P<num>\d+)\b", re.IGNORECASE),
+    re.compile(r"\blesson\s+(?P<num>\d+)\s+overview\b", re.IGNORECASE),
+    re.compile(r"\boverview of lesson\s+(?P<num>\d+)\b", re.IGNORECASE),
+    re.compile(r"\bsummary of lesson\s+(?P<num>\d+)\b", re.IGNORECASE),
+    re.compile(r"\bwhat(?:'?s|\s+is)\s+in lesson\s+(?P<num>\d+)\b", re.IGNORECASE),
+    re.compile(r"\bwhat does lesson\s+(?P<num>\d+)\s+cover\b", re.IGNORECASE),
+]
+
+
+def extract_lesson_number(text: str) -> Optional[int]:
+    """Return the lesson number if text matches a lesson overview request pattern."""
+    for pattern in LESSON_OVERVIEW_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return int(match.group("num"))
+    return None
+
+
+# Patterns to detect "what's the goal/task for lesson X" style requests.
+# Deliberately requires a goal/task keyword next to "lesson N" so it does not
+# overlap with LESSON_OVERVIEW_PATTERNS (which answers "what is lesson X about").
+LESSON_GOAL_PATTERNS: List[Pattern] = [
+    re.compile(r"\bgoal(?:s)?\s+for\s+lesson\s+(?P<num>\d+)\b", re.IGNORECASE),
+    re.compile(r"\btask\s+for\s+lesson\s+(?P<num>\d+)\b", re.IGNORECASE),
+    re.compile(r"\blesson\s+(?P<num>\d+)\s*(?:'s)?\s+(?:goal|task)\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+(?:do|should)\s+i\s+(?:need\s+to\s+)?do\s+for\s+lesson\s+(?P<num>\d+)\b", re.IGNORECASE),
+    re.compile(r"\bwhat'?s\s+the\s+goal\s+(?:for|of)\s+lesson\s+(?P<num>\d+)\b", re.IGNORECASE),
+]
+
+# Patterns to detect "what's the focus for week X" style requests.
+WEEK_FOCUS_PATTERNS: List[Pattern] = [
+    re.compile(r"\bfocus\s+for\s+week\s+(?P<num>\d+)\b", re.IGNORECASE),
+    re.compile(r"\bfocus\s+of\s+week\s+(?P<num>\d+)\b", re.IGNORECASE),
+    re.compile(r"\bweek\s+(?P<num>\d+)\s*(?:'s)?\s+focus\b", re.IGNORECASE),
+    re.compile(r"\bwhat'?s\s+the\s+focus\s+(?:for|of)\s+week\s+(?P<num>\d+)\b", re.IGNORECASE),
+]
+
+# Matches "what's my focus/goal this week" style requests with NO lesson/week
+# number given — these require a clarifying question (or remembered state).
+GENERIC_WEEKLY_QUERY_PATTERNS: List[Pattern] = [
+    re.compile(r"\b(?:my\s+)?focus\s+(?:for\s+)?this\s+week\b", re.IGNORECASE),
+    re.compile(r"\bfocus\s+this\s+week\b", re.IGNORECASE),
+    re.compile(r"\b(?:my\s+)?goals?\s+(?:for\s+)?this\s+week\b", re.IGNORECASE),
+    re.compile(r"\bwhat'?s\s+my\s+(?:focus|goal)\b", re.IGNORECASE),
+]
+
+# Broad, passive detection of a stated lesson/week number (question or plain
+# statement), used only to remember progress across turns — not to trigger
+# an override response by itself.
+_STATED_LESSON_PATTERN = re.compile(r"\blesson\s+(?P<num>\d+)\b", re.IGNORECASE)
+_STATED_WEEK_PATTERN = re.compile(r"\bweek\s+(?P<num>\d+)\b", re.IGNORECASE)
+
+
+def extract_lesson_goal_number(text: str) -> Optional[int]:
+    """Return the lesson number if text asks for that lesson's goal/task."""
+    for pattern in LESSON_GOAL_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return int(match.group("num"))
+    return None
+
+
+def extract_week_focus_number(text: str) -> Optional[int]:
+    """Return the week number if text asks for that week's focus."""
+    for pattern in WEEK_FOCUS_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return int(match.group("num"))
+    return None
+
+
+def is_generic_weekly_query(text: str) -> bool:
+    """Return True if text asks about "this week's" focus/goals with no number given."""
+    if extract_lesson_goal_number(text) is not None or extract_week_focus_number(text) is not None:
+        return False
+    return any(pattern.search(text) for pattern in GENERIC_WEEKLY_QUERY_PATTERNS)
+
+
+def extract_stated_lesson_or_week(text: str) -> tuple[Optional[int], Optional[int]]:
+    """Return any (lesson_num, week_num) mentioned in text, for remembering progress."""
+    lesson_match = _STATED_LESSON_PATTERN.search(text)
+    week_match = _STATED_WEEK_PATTERN.search(text)
+    lesson_num = int(lesson_match.group("num")) if lesson_match else None
+    week_num = int(week_match.group("num")) if week_match else None
+    return lesson_num, week_num
+
+
+# Matches a message that is ONLY a short "lesson N" / "week N" statement (optionally
+# prefixed with "I'm on"), e.g. answering "Which lesson (or week) are you on?" with
+# "lesson 6" or "week 4" — as opposed to a longer message that merely mentions a
+# lesson/week in passing.
+BARE_LESSON_STATEMENT_PATTERN = re.compile(
+    r"^\s*(?:i'?m\s+(?:on|currently\s+on)\s+)?lesson\s+(?P<num>\d+)\s*[.!]?\s*$", re.IGNORECASE
+)
+BARE_WEEK_STATEMENT_PATTERN = re.compile(
+    r"^\s*(?:i'?m\s+(?:on|currently\s+on)\s+)?week\s+(?P<num>\d+)\s*[.!]?\s*$", re.IGNORECASE
+)
+
+# Matches a message that is ONLY a bare 1-2 digit number, e.g. answering "Which
+# lesson (or week) are you on?" with just "6" — ambiguous between lesson and week.
+BARE_NUMBER_PATTERN = re.compile(r"^\s*(?P<num>\d{1,2})\s*[.!]?\s*$")
+
+
+def extract_bare_lesson_statement(text: str) -> Optional[int]:
+    """Return the lesson number if the whole message is just "lesson N" (or "I'm on lesson N")."""
+    match = BARE_LESSON_STATEMENT_PATTERN.match(text)
+    return int(match.group("num")) if match else None
+
+
+def extract_bare_week_statement(text: str) -> Optional[int]:
+    """Return the week number if the whole message is just "week N" (or "I'm on week N")."""
+    match = BARE_WEEK_STATEMENT_PATTERN.match(text)
+    return int(match.group("num")) if match else None
+
+
+def extract_bare_number(text: str) -> Optional[int]:
+    """Return the number if the whole message is just a bare 1-2 digit number."""
+    match = BARE_NUMBER_PATTERN.match(text)
+    return int(match.group("num")) if match else None
+
+
+# Patterns to detect technical support questions about the study app or devices.
+TECHNICAL_SUPPORT_PATTERNS: List[Pattern] = [
+    # Device name + connectivity/problem signal (no trailing \b — handles "connecting", "syncing", "pairing")
+    re.compile(
+        r"\b(fitbit|garmin|apple\s*watch|samsung\s*watch|smartwatch|wearable|fitness\s*tracker)\b"
+        r".{0,60}\b(not\s+connect\w*|won'?t\s+connect\w*|can'?t\s+connect\w*|not\s+sync\w*|won'?t\s+sync\w*|"
+        r"can'?t\s+sync\w*|not\s+pair\w*|won'?t\s+pair\w*|not\s+work\w*|issue|problem|error)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(not\s+connect\w*|won'?t\s+connect\w*|can'?t\s+connect\w*|not\s+sync\w*|won'?t\s+sync\w*|can'?t\s+sync\w*)"
+        r".{0,60}\b(fitbit|garmin|apple\s*watch|samsung\s*watch|smartwatch|wearable|tracker|device)\b",
+        re.IGNORECASE,
+    ),
+    # App crashes / errors
+    re.compile(r"\bapp\s+(keeps?\s+)?(crash\w*|not\s+work\w*|won'?t\s+(?:open|load|start)|freez\w*)\b", re.IGNORECASE),
+    re.compile(r"\b(app|application)\b.{0,40}\b(crash\w*|error|broken|not\s+work\w*|freez\w*)\b", re.IGNORECASE),
+    # Login / access
+    re.compile(r"\bcan'?t\s+(log\s*in|login|sign\s*in)\b", re.IGNORECASE),
+    re.compile(r"\b(forgot|reset|lost)\b.{0,15}\bpassword\b", re.IGNORECASE),
+    re.compile(r"\blocked\s+out\b", re.IGNORECASE),
+    # Error messages
+    re.compile(r"\berror\s+message\b", re.IGNORECASE),
+    re.compile(r"\b(getting|seeing)\s+an?\s+error\b", re.IGNORECASE),
+    # Technical issue / support
+    re.compile(r"\btechnical\s+(issue|problem|support|help|error)\b", re.IGNORECASE),
+    # "how do I use" + app-specific UI terms
+    re.compile(
+        r"\bhow\s+do\s+i\s+use\b.{0,40}\b(feature|button|section|tab|setting|notification|reminder|dashboard|log)\b",
+        re.IGNORECASE,
+    ),
+]
+
+TECHNICAL_SUPPORT_RESPONSE = (
+    "For technical support, please reach out to support@pathverse.ca. "
+    "Please include any relevant information or screenshots of the problem "
+    "in your message so we can help."
+)
+
+CHATBOT_HELP_PATTERNS: List[Pattern] = [
+    re.compile(r"\bwhat\s+can\s+(you|this\s+(bot|chatbot|assistant|coach))\s+(do|help\s+with)\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+are\s+your\s+(features?|capabilities|functions?|abilities)\b", re.IGNORECASE),
+    re.compile(r"\bhow\s+do(es)?\s+(this|the)\s+(chatbot|bot|assistant|coach|app)\s+work\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+(topics?|things?)\s+can\s+(you|this)\s+(help|cover|discuss|talk\s+about)\b", re.IGNORECASE),
+    re.compile(r"\bhow\s+(should\s+i|do\s+i|can\s+i)\s+use\s+(you|this\s+(chatbot|bot|assistant|coach))\b", re.IGNORECASE),
+    re.compile(r"\b(guide|instructions?|tutorial)\s+(for|on|to\s+use)\s+(the\s+)?(chatbot|bot|assistant|coach)\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+questions?\s+can\s+i\s+ask\b", re.IGNORECASE),
+    re.compile(r"\bhelp\s+me\s+use\s+(you|this|the\s+(chatbot|bot|assistant|coach))\b", re.IGNORECASE),
+]
+
+CHATBOT_HELP_RESPONSE = (
+    "For a full guide on how to use the coaching assistant, check out the Resources section in the app "
+    "and look for the Chatbot Help guide."
+)
+
+# Patterns for detecting emotional regulation needs
+EMOTION_STRONG_PATTERNS: List[Pattern] = [
+    re.compile(r"\b(stress|stressed|stressful)\s+(about|around)\s+(exercise|activity|moving|movement|being active)\b", re.IGNORECASE),
+    re.compile(r"\b(anxious|anxiety)\s+(about|around)\s+(exercise|activity|moving|movement|being active)\b", re.IGNORECASE),
+    re.compile(r"\bdread(?:ing)?\s+(exercise|activity|moving|movement|being active)\b", re.IGNORECASE),
+    re.compile(r"\bfeel\s+(guilty|ashamed|embarrassed)\s+about\s+(exercise|activity|being active)\b", re.IGNORECASE),
+    re.compile(r"\bexercise\s+makes\s+me\s+(anxious|stressed|guilty|ashamed|embarrassed)\b", re.IGNORECASE),
+]
+
+EMOTION_WEAK_PATTERNS: List[Pattern] = [
+    re.compile(r"\b(stress|stressed|stressful)\b", re.IGNORECASE),
+    re.compile(r"\banxious\b", re.IGNORECASE),
+    re.compile(r"\banxiety\b", re.IGNORECASE),
+    re.compile(r"\bdread\b", re.IGNORECASE),
+    re.compile(r"\bguilty\b", re.IGNORECASE),
+    re.compile(r"\bshame\b", re.IGNORECASE),
+    re.compile(r"\bashamed\b", re.IGNORECASE),
+    re.compile(r"\bfrustrated\b", re.IGNORECASE),
+    re.compile(r"\bfrustration\b", re.IGNORECASE),
+    re.compile(r"\boverwhelmed\b", re.IGNORECASE),
+    re.compile(r"\bembarrassed\b", re.IGNORECASE),
+    re.compile(r"\bself-conscious\b", re.IGNORECASE),
+]
+
+# Patterns for filtering action suggestions from educational responses
+ACTION_SUGGESTION_PATTERNS: List[Pattern] = [
+    re.compile(r"\btry\b", re.IGNORECASE),
+    re.compile(r"\bstart (?:with|by)\b", re.IGNORECASE),
+    re.compile(r"\bconsider\b", re.IGNORECASE),
+    re.compile(r"\bexplore\b", re.IGNORECASE),
+    re.compile(r"\bhow about\b", re.IGNORECASE),
+    re.compile(r"\byou could\b", re.IGNORECASE),
+    re.compile(r"\byou might\b", re.IGNORECASE),
+    re.compile(r"\bwould you\b", re.IGNORECASE),
+    re.compile(r"\bif you(?:'re| are)?\s+open\b", re.IGNORECASE),
+    re.compile(r"\bif you want to\b", re.IGNORECASE),
+    re.compile(r"\bfind movement\b", re.IGNORECASE),
+    re.compile(r"\bif you ever\b", re.IGNORECASE),
+    re.compile(r"\bif you decide to\b", re.IGNORECASE),
+]
+
+
+def infer_process_layer(text: str) -> LayerInference:
+    """
+    Infer which M-PAC layer (reflective, regulatory, reflexive) is most active.
+
+    M-PAC is a motivational framework with three layers:
+    - Reflexive: Automatic habits (frequency + routine language)
+    - Regulatory: Planning/execution (frequency without routine)
+    - Reflective: Thinking/considering (feelings, opportunities, planning)
+
+    Returns inference with confidence score based on signal strength.
+    """
+
+    lowered = text.lower()
+    signals = LayerSignals(
+        has_frequency=_contains_patterns(lowered, FREQUENCY_PATTERNS),
+        has_timeframe=_contains_patterns(lowered, TIMEFRAME_PATTERNS),
+        has_routine_language=_contains_keywords(lowered, ROUTINE_KEYWORDS),
+        has_planning_language=_contains_keywords(lowered, PLANNING_KEYWORDS),
+        has_not_started_language=_contains_keywords(lowered, NOT_STARTED_KEYWORDS),
+        has_affective_language=_contains_keywords(lowered, AFFECTIVE_KEYWORDS),
+        has_opportunity_language=_contains_keywords(lowered, OPPORTUNITY_KEYWORDS),
+        has_progressive_statement=bool(re.search(r"\bbeen\s+\w+ing\b", lowered)),
+    )
+
+    layer: str | None = None
+    has_progressive_habit = signals.has_progressive_statement and signals.has_timeframe
+    has_habit_pair = (signals.has_routine_language or has_progressive_habit) and (
+        signals.has_frequency or signals.has_timeframe
+    )
+    has_regular_frequency_over_time = signals.has_frequency and signals.has_timeframe
+    expresses_feelings_or_opportunity = signals.has_affective_language or signals.has_opportunity_language
+    has_behavior_signals = signals.behavior_evidence
+
+    if has_habit_pair or has_regular_frequency_over_time:
+        layer = "reflexive"
+    elif expresses_feelings_or_opportunity:
+        layer = "ongoing_reflective"
+    elif signals.has_frequency or signals.has_timeframe:
+        layer = "regulatory"
+    elif signals.has_planning_language or signals.has_not_started_language:
+        layer = "initiating_reflective"
+    elif not has_behavior_signals:
+        layer = None
+
+    confidence = 0.0
+    if layer == "reflexive":
+        confidence = 0.55
+        if signals.has_frequency:
+            confidence += 0.15
+        if signals.has_timeframe:
+            confidence += 0.15
+        if signals.has_routine_language:
+            confidence += 0.1
+    elif layer == "regulatory":
+        confidence = 0.5
+        if signals.has_frequency:
+            confidence += 0.25
+        if signals.has_timeframe:
+            confidence += 0.1
+        if signals.has_routine_language:
+            confidence += 0.05
+    elif layer == "ongoing_reflective":
+        confidence = 0.45
+        if signals.has_affective_language:
+            confidence += 0.25
+        if signals.has_opportunity_language:
+            confidence += 0.2
+        if signals.behavior_evidence:
+            confidence += 0.1
+    elif layer == "initiating_reflective":
+        confidence = 0.45
+        if signals.has_planning_language:
+            confidence += 0.25
+        if signals.has_not_started_language:
+            confidence += 0.25
+        if not signals.behavior_evidence:
+            confidence += 0.1
+
+    confidence = min(confidence, 0.95)
+    return LayerInference(layer=layer, confidence=confidence, signals=signals)
+
+
+def pick_layer_question(signals: LayerSignals) -> str | None:
+    """Return the best clarifying question based on missing supportive cues."""
+
+    if not signals.behavior_evidence:
+        return FREQUENCY_QUESTION
+    if signals.has_frequency and not signals.has_routine_language:
+        return ROUTINE_QUESTION
+    if signals.has_frequency and not signals.has_timeframe:
+        return TIMEFRAME_QUESTION
+    if signals.has_timeframe and not signals.has_frequency:
+        return FREQUENCY_QUESTION
+    return None
+
+
+def infer_barrier(text: str) -> str | None:
+    """Infer the user's primary barrier to physical activity."""
+    lowered = text.lower()
+    barrier_map = {
+        "time pressure": [
+            "busy",
+            "no time",
+            "schedule",
+            "travel",
+            "work",
+            "appointments",
+            "errands",
+            "looking after",
+            "caregiving",
+            "day gets away",
+        ],
+        "motivation dip": [
+            "motivation",
+            "don't feel",
+            "lazy",
+            "energy",
+            "tired",
+            "drained",
+            "low energy",
+            "worn out",
+            "hard to get going",
+            "no drive",
+            "can't get motivated",
+        ],
+        "weather": [
+            "weather",
+            "cold",
+            "hot",
+            "rain",
+            "snow",
+            "winter",
+            "icy",
+            "slippery",
+            "too hot",
+            "too cold",
+        ],
+        "pain or discomfort": [
+            "pain",
+            "ache",
+            "sore",
+            "injury",
+            "hurt",
+            "stiff",
+            "stiffness",
+            "joint pain",
+            "back pain",
+            "knee pain",
+        ],
+        "confidence": [
+            "nervous",
+            "intimidated",
+            "embarrassed",
+            "worried",
+            "afraid",
+            "fear of falling",
+            "not confident",
+        ],
+    }
+    for label, keywords in barrier_map.items():
+        if any(keyword in lowered for keyword in keywords):
+            return label
+    return None
+
+
+def infer_activities(text: str) -> str | None:
+    """Infer which physical activities the user mentions."""
+    lowered = text.lower()
+    activity_map = {
+        "walking": [
+            "walk",
+            "walking",
+            "hike",
+            "go for a walk",
+            "walking outside",
+            "walking group",
+            "group walk",
+            "walking club",
+        ],
+        "light strength": [
+            "strength",
+            "weights",
+            "dumbbell",
+            "resistance",
+            "band",
+            "strength training",
+            "bodyweight",
+            "light weights",
+        ],
+        "mobility": [
+            "stretch",
+            "stretching",
+            "mobility",
+            "yoga",
+            "range of motion",
+            "flexibility",
+            "tai chi",
+            "taichi",
+        ],
+        "cycling": [
+            "bike",
+            "cycling",
+            "spin",
+            "stationary bike",
+            "exercise bike",
+        ],
+        "swimming": [
+            "swim",
+            "swimming",
+            "pool",
+            "water",
+            "aquafit",
+            "water aerobics",
+            "aqua fitness",
+        ],
+        "golf": [
+            "golf",
+            "golfing",
+            "driving range",
+        ],
+        "pickleball": [
+            "pickleball",
+        ],
+    }
+    found: List[str] = []
+    for label, keywords in activity_map.items():
+        if any(keyword in lowered for keyword in keywords):
+            found.append(label)
+    if found:
+        return ", ".join(dict.fromkeys(found))
+    return None
+
+
+def infer_time_available(text: str) -> str | None:
+    """Infer how much time the user has available for activity."""
+    match = re.search(r"(?:about|around)?\s*(\d{1,2})\s*(?:minutes?|mins?|min\.?|m)\b", text, flags=re.IGNORECASE)
+    if match:
+        minutes = match.group(1)
+        return f"{minutes} minutes"
+    if "half hour" in text.lower():
+        return "30 minutes"
+    return None
+
+
+SCIENCE_FOR_LESSON_PATTERNS: List[Pattern] = [
+    re.compile(r"science.*?\blesson\s+(\d+)\b", re.IGNORECASE),
+    re.compile(r"\blesson\s+(\d+)\b.*?\bscience\b", re.IGNORECASE),
+]
+
+
+def detect_science_for_lesson(text: str) -> Optional[int]:
+    """Return the lesson number when the user asks for the science behind a lesson."""
+    for pattern in SCIENCE_FOR_LESSON_PATTERNS:
+        match = pattern.search(text or "")
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def science_module_for_lesson(lesson_num: int) -> int:
+    """Map a lesson to its Science Behind module: 1-3 -> 1, 4-6 -> 2, 7-10 -> 3."""
+    if lesson_num <= 3:
+        return 1
+    if lesson_num <= 6:
+        return 2
+    return 3

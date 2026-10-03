@@ -1,0 +1,459 @@
+"""Runtime retrieval helpers that connect to Qdrant via LlamaIndex with content sanitization."""
+
+from __future__ import annotations
+
+import html
+import re
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence
+
+from llama_index.core import Settings, VectorStoreIndex
+from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+
+from rag.config import RagConfig
+from rag.parsing_master import MasterChunk, parse_master_file
+from rag.router import ActivityFilters, RouteDecision
+
+_SCIENCE_MODULE_NAMES = {
+    1: "The Science Behind Lessons 1-3 (WHY to be Active)",
+    2: "The Science Behind Lessons 4-6 (HOW to be Active)",
+    3: "The Science Behind Lessons 7-10 (Sustaining Your Changes)",
+}
+
+logger = logging.getLogger(__name__)
+
+_RAG_CACHE_SIZE = 256  # Max cached (query, decision) results per retriever instance
+
+
+def _node_content(node: Any) -> str:
+    """
+    Extract text content from a node.
+
+    Args:
+        node: LlamaIndex node object
+
+    Returns:
+        Text content
+    """
+    if hasattr(node, "get_content"):
+        try:
+            return node.get_content(metadata_mode="none")
+        except TypeError:
+            return node.get_content()
+    return getattr(node, "text", "")
+
+
+def _sanitize_text(text: str) -> str:
+    """
+    Sanitize retrieved text to prevent injection attacks.
+
+    This is a defense-in-depth measure. Retrieved content should be trusted,
+    but we sanitize to prevent:
+    - HTML/script injection if content is ever displayed in a web context
+    - Control characters that could interfere with the LLM prompt
+    - Excessive whitespace or formatting issues
+
+    Args:
+        text: Raw text from vector store
+
+    Returns:
+        Sanitized text
+    """
+    if not text:
+        return ""
+
+    # Remove control characters (except newlines and tabs)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+
+    # Escape HTML entities (if content ever displayed in web UI)
+    text = html.escape(text, quote=False)
+
+    # Normalize whitespace
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
+
+    return text
+
+
+def _truncate(text: str, limit: int = 1200) -> str:
+    """
+    Truncate text to a maximum length with sanitization.
+
+    Args:
+        text: Text to truncate
+        limit: Maximum length
+
+    Returns:
+        Truncated and sanitized text
+    """
+    cleaned = _sanitize_text(text)
+    if len(cleaned) <= limit:
+        return cleaned
+    truncated = cleaned[:limit]
+    last_boundary = max(truncated.rfind(". "), truncated.rfind(".\n"))
+    if last_boundary > limit * 0.5:
+        truncated = truncated[:last_boundary + 1]
+    return f"{truncated.rstrip()}..."
+
+
+@dataclass
+class RetrievedChunk:
+    doc_type: str
+    text: str
+    metadata: Dict[str, Any]
+    score: Optional[float] = None
+
+    def label(self) -> str:
+        if self.doc_type == "master":
+            if self.metadata.get("content_type") == "science":
+                module = self.metadata.get("science_module_number")
+                module_name = _SCIENCE_MODULE_NAMES.get(module, f"Science Module {module}")
+                slide = self.metadata.get("science_slide_number")
+                title = self.metadata.get("slide_title") or ""
+                return f"{module_name}, Page {slide}: {title}".strip()
+            lesson = self.metadata.get("lesson_number")
+            slide = self.metadata.get("slide_number")
+            title = self.metadata.get("slide_title") or ""
+            return f"Lesson {lesson}, Page {slide}: {title}".strip()
+        if self.doc_type == "home_activity":
+            resource_type = self.metadata.get("resource_type", "resource")
+            ref_num = self.metadata.get("ref_number", "?")
+            name = self.metadata.get("activity_name", "Activity")
+            type_label = {"video": "Individual Video", "playlist": "Video Playlist", "blog": "Blog"}.get(resource_type, "Resource")
+            return f"{type_label} #{ref_num}: {name}"
+        activity_name = self.metadata.get("activity_name", "Activity")
+        location = self.metadata.get("location", "")
+        return f"{activity_name} ({location})".strip()
+
+    def lesson_reference(self) -> Optional[str]:
+        """Return a lesson-level reference (no slide info)."""
+        if self.doc_type == "master":
+            if self.metadata.get("content_type") == "science":
+                module = self.metadata.get("science_module_number")
+                return _SCIENCE_MODULE_NAMES.get(module, f"Science Module {module}")
+            lesson = self.metadata.get("lesson_number")
+            lesson_title = self.metadata.get("lesson_title") or "Untitled lesson"
+            return f"Lesson {lesson}: {lesson_title}"
+        return self.reference()
+
+    def reference(self) -> Optional[str]:
+        if self.doc_type == "master":
+            if self.metadata.get("content_type") == "science":
+                module = self.metadata.get("science_module_number")
+                module_name = _SCIENCE_MODULE_NAMES.get(module, f"Science Module {module}")
+                slide = self.metadata.get("science_slide_number")
+                slide_title = self.metadata.get("slide_title") or "Untitled slide"
+                return f"{module_name}, Page {slide}: {slide_title}"
+            lesson = self.metadata.get("lesson_number")
+            slide = self.metadata.get("slide_number")
+            slide_title = self.metadata.get("slide_title") or "Untitled slide"
+            return f"Lesson {lesson}, Page {slide}: {slide_title}"
+        if self.doc_type == "activity":
+            name = self.metadata.get("activity_name", "Activity")
+            location = self.metadata.get("location", "Location TBD")
+            schedule = self.metadata.get("schedule", "Schedule TBD")
+            cost = self.metadata.get("cost_raw", "Cost unknown")
+            return f"{name} at {location} — {schedule}, {cost}"
+        if self.doc_type == "home_activity":
+            resource_type = self.metadata.get("resource_type", "resource")
+            ref_num = self.metadata.get("ref_number", "?")
+            name = self.metadata.get("activity_name", "Activity")
+            type_label = {"video": "Individual Video", "playlist": "Video Playlist", "blog": "Blog"}.get(resource_type, "Resource")
+            return f"{type_label} {ref_num}: {name}"
+        return None
+
+
+@dataclass
+class RetrievalResult:
+    master_chunks: Sequence[RetrievedChunk]
+    activity_chunks: Sequence[RetrievedChunk]
+    home_chunks: Sequence[RetrievedChunk] = field(default_factory=list)
+
+    def _reference_sort_key(self, chunk: RetrievedChunk) -> tuple:
+        if chunk.doc_type == "master":
+            global_idx = chunk.metadata.get("global_slide_number") or 0
+            if chunk.metadata.get("content_type") == "science":
+                # Sort science after lessons, ordered by global slide number
+                return (1, int(global_idx))
+            lesson = chunk.metadata.get("lesson_number") or 0
+            slide = chunk.metadata.get("slide_number") or 0
+            return (0, int(lesson), int(slide), int(global_idx))
+        if chunk.doc_type == "activity":
+            activity_id = chunk.metadata.get("activity_id") or 0
+            return (2, int(activity_id))
+        if chunk.doc_type == "home_activity":
+            ref_num = chunk.metadata.get("ref_number") or 0
+            return (2, int(ref_num))
+        return (3, 0)
+
+    def build_prompt_context(self) -> str:
+        sections: List[str] = []
+        if self.master_chunks:
+            sections.append(self._format_section("Master slides", self.master_chunks))
+        if self.activity_chunks:
+            sections.append(self._format_section("Local activities", self.activity_chunks))
+        if self.home_chunks:
+            sections.append(self._format_section("At-home resources", self.home_chunks))
+        return "\n\n".join(sections)
+
+    def _format_section(self, title: str, chunks: Sequence[RetrievedChunk]) -> str:
+        lines = [f"{title}:"]
+        for chunk in chunks:
+            lines.append(f"- {chunk.label()}\n  {_truncate(chunk.text)}")
+        return "\n".join(lines)
+
+    def references(self) -> List[str]:
+        refs: List[str] = []
+        seen = set()
+        chunks = list(self.master_chunks) + list(self.activity_chunks) + list(self.home_chunks)
+        for chunk in sorted(chunks, key=self._reference_sort_key):
+            citation = chunk.reference()
+            if citation and citation not in seen:
+                seen.add(citation)
+                refs.append(citation)
+        return refs
+
+
+class RagRetriever:
+    """Builds query engines for the master and activity indexes."""
+
+    def __init__(self, config: RagConfig) -> None:
+        self.config = config
+        Settings.embed_model = OpenAIEmbedding(model=config.embedding_model, api_key=config.openai_api_key)
+        self.client = QdrantClient(url=config.qdrant_url, api_key=config.qdrant_api_key)
+        # Validate Qdrant is reachable before building indexes
+        try:
+            self.client.get_collections()
+            logger.info(f"Qdrant connection verified at {config.qdrant_url}")
+        except Exception as exc:
+            raise RuntimeError(f"Cannot connect to Qdrant at {config.qdrant_url}: {exc}") from exc
+        self.master_index = self._build_index(config.master_collection)
+        self.activity_index = self._build_index(config.activities_collection)
+        self.home_index = self._build_index(config.home_collection)
+        self._cache: dict = {}  # (query, decision_key) -> RetrievalResult
+        self._master_by_global_slide: Dict[int, MasterChunk] = self._load_master_slide_index(config)
+
+    def _load_master_slide_index(self, config: RagConfig) -> Dict[int, MasterChunk]:
+        """Load the master slide deck by global_slide_number for neighbor-slide lookups.
+
+        Parses the same source file used at ingest time, so slide text/metadata here
+        matches what's embedded in Qdrant. Non-fatal on failure — neighbor stitching
+        is a context-quality enhancement, not required for retrieval to function.
+        """
+        try:
+            chunks = parse_master_file(config.master_data_path)
+            return {chunk.metadata["global_slide_number"]: chunk for chunk in chunks}
+        except Exception as exc:
+            logger.warning(f"Could not load master slide index for neighbor stitching: {exc}")
+            return {}
+
+    def _build_index(self, collection_name: str) -> VectorStoreIndex:
+        vector_store = QdrantVectorStore(client=self.client, collection_name=collection_name)
+        return VectorStoreIndex.from_vector_store(vector_store=vector_store)
+
+    def _build_retriever(self, index: VectorStoreIndex, top_k: int) -> VectorIndexRetriever:
+        return index.as_retriever(similarity_top_k=top_k)
+
+    def _retrieve_chunks(self, index: VectorStoreIndex, query: str, top_k: int, default_doc_type: str) -> List[RetrievedChunk]:
+        """Retrieve nodes from an index and wrap them into RetrievedChunk objects."""
+        nodes = self._build_retriever(index, top_k).retrieve(query)
+        return [
+            RetrievedChunk(
+                doc_type=node.node.metadata.get("doc_type", default_doc_type),
+                text=_node_content(node.node),
+                metadata=node.node.metadata,
+                score=node.score,
+            )
+            for node in nodes
+        ]
+
+    def retrieve_master(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+        *,
+        prefer_science: bool = False,
+        science_module: Optional[int] = None,
+    ) -> List[RetrievedChunk]:
+        base_top_k = top_k or self.config.master_top_k
+        # Over-fetch to ensure k chunks survive post-retrieval filtering
+        # (science gating, do-not-reference). Wider net for science queries.
+        retrieval_top_k = base_top_k * 3 if prefer_science else base_top_k * 2
+        if science_module is not None:
+            retrieval_top_k = base_top_k * 10
+        chunks = self._retrieve_chunks(self.master_index, query, retrieval_top_k, "master")
+        chunks = [
+            c for c in chunks
+            if not c.metadata.get("do_not_reference", False)
+        ]
+        if science_module is not None:
+            chunks = [
+                c for c in chunks
+                if c.metadata.get("content_type") == "science"
+                and c.metadata.get("science_module_number") == science_module
+            ]
+        if prefer_science:
+            # Sort science slides first, then by score descending, before truncating
+            chunks.sort(key=lambda c: (0 if c.metadata.get("content_type") == "science" else 1, -(c.score or 0.0)))
+        chunks = chunks[:base_top_k]
+        self._attach_neighbor_slides(chunks)
+        return chunks
+
+    def _attach_neighbor_slides(self, chunks: List[RetrievedChunk]) -> None:
+        """Append each chunk's immediate neighbor slide text, when it belongs to the
+        same lesson/science module. A single slide is often only part of a concept's
+        explanation; the adjacent slide frequently carries the rest of it.
+        """
+        if not self._master_by_global_slide:
+            return
+        selected_globals = {c.metadata.get("global_slide_number") for c in chunks}
+        for chunk in chunks:
+            global_num = chunk.metadata.get("global_slide_number")
+            if global_num is None:
+                continue
+            for neighbor_num in (global_num + 1, global_num - 1):
+                neighbor = self._master_by_global_slide.get(neighbor_num)
+                if not neighbor or neighbor_num in selected_globals:
+                    continue
+                if neighbor.metadata.get("do_not_reference"):
+                    continue
+                same_lesson = (
+                    chunk.metadata.get("lesson_number") is not None
+                    and neighbor.metadata.get("lesson_number") == chunk.metadata.get("lesson_number")
+                )
+                same_science_module = (
+                    chunk.metadata.get("science_module_number") is not None
+                    and neighbor.metadata.get("science_module_number") == chunk.metadata.get("science_module_number")
+                )
+                if not (same_lesson or same_science_module):
+                    continue
+                chunk.text = f"{chunk.text}\n{neighbor.text}"
+                selected_globals.add(neighbor_num)
+                break
+
+    def retrieve_activities(
+        self,
+        query: str,
+        *,
+        filters: Optional[ActivityFilters] = None,
+        top_k: Optional[int] = None,
+    ) -> List[RetrievedChunk]:
+        base_top_k = top_k or self.config.activity_top_k
+        # Over-fetch to ensure k chunks survive any filtering
+        retrieval_top_k = max(base_top_k * 2, 8)
+        chunks = self._retrieve_chunks(self.activity_index, query, retrieval_top_k, "activity")
+        if filters:
+            chunks = self._apply_activity_filters(chunks, filters)
+        return chunks[:base_top_k]
+
+    def _apply_activity_filters(self, chunks: List[RetrievedChunk], filters: ActivityFilters) -> List[RetrievedChunk]:
+        def matches(chunk: RetrievedChunk) -> bool:
+            metadata = chunk.metadata
+            if filters.cost_label:
+                if metadata.get("cost_label") != filters.cost_label:
+                    return False
+            if filters.activity_type:
+                if metadata.get("activity_type") != filters.activity_type:
+                    return False
+            if filters.location:
+                location = (metadata.get("location") or "").lower()
+                aliases = [alias.lower() for alias in metadata.get("aliases", [])]
+                target = filters.location.lower()
+                if target not in location and target not in aliases:
+                    return False
+            if filters.days:
+                chunk_days = [day.lower() for day in metadata.get("days", [])]
+                if not any(day.lower() in chunk_days for day in filters.days):
+                    return False
+            return True
+
+        return [chunk for chunk in chunks if matches(chunk)]
+
+    def retrieve_home(
+        self,
+        query: str,
+        *,
+        activity_type: Optional[str] = None,
+        resource_type: Optional[str] = None,
+        top_k: Optional[int] = None,
+    ) -> List[RetrievedChunk]:
+        base_top_k = top_k or self.config.home_top_k
+        # Over-fetch to ensure k chunks survive any type/resource filtering
+        retrieval_top_k = base_top_k * 2
+        chunks = self._retrieve_chunks(self.home_index, query, retrieval_top_k, "home_activity")
+        if activity_type:
+            chunks = [c for c in chunks if c.metadata.get("activity_type") == activity_type]
+        if resource_type:
+            resource_filtered = [c for c in chunks if c.metadata.get("resource_type") == resource_type]
+            if resource_filtered:
+                chunks = resource_filtered
+            # else: fall back to activity_type results (e.g. yoga exists only as a blog, not a video)
+        return chunks[:base_top_k]
+
+    @staticmethod
+    def _decision_key(decision: RouteDecision) -> tuple:
+        """Convert a RouteDecision to a hashable cache key."""
+        filters = decision.activity_filters
+        filters_key = (
+            filters.cost_label,
+            tuple(filters.days or []),
+            filters.location,
+            filters.activity_type,
+        ) if filters else None
+        return (
+            decision.use_master,
+            decision.use_activities,
+            decision.use_home,
+            decision.prefer_science,
+            decision.home_resource_type,
+            filters_key,
+        )
+
+    def gather_context(self, query: str, decision: RouteDecision, science_module: Optional[int] = None) -> RetrievalResult:
+        cache_key = (query, self._decision_key(decision), science_module)
+        if cache_key in self._cache:
+            logger.debug("RAG cache hit for query: %.40s...", query)
+            return self._cache[cache_key]
+
+        # Build a map of collection name -> callable for each enabled collection,
+        # then run them in parallel via threads (I/O-bound: Qdrant + embedding calls).
+        activity_type = decision.activity_filters.activity_type if decision.activity_filters else None
+        tasks = {}
+        if decision.use_master:
+            tasks["master"] = lambda: self.retrieve_master(
+                query, prefer_science=decision.prefer_science, science_module=science_module
+            )
+        if decision.use_activities:
+            tasks["activity"] = lambda: self.retrieve_activities(query, filters=decision.activity_filters)
+        if decision.use_home:
+            tasks["home"] = lambda: self.retrieve_home(
+                query,
+                activity_type=activity_type,
+                resource_type=decision.home_resource_type,
+            )
+
+        results_map: Dict[str, List[RetrievedChunk]] = {}
+        if len(tasks) == 1:
+            # Single collection: no thread overhead needed
+            name, fn = next(iter(tasks.items()))
+            results_map[name] = fn()
+        elif len(tasks) > 1:
+            with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+                future_to_name = {executor.submit(fn): name for name, fn in tasks.items()}
+                for future in as_completed(future_to_name):
+                    results_map[future_to_name[future]] = future.result()
+
+        result = RetrievalResult(
+            master_chunks=results_map.get("master", []),
+            activity_chunks=results_map.get("activity", []),
+            home_chunks=results_map.get("home", []),
+        )
+        if len(self._cache) >= _RAG_CACHE_SIZE:
+            self._cache.pop(next(iter(self._cache)))  # evict oldest entry
+        self._cache[cache_key] = result
+        return result
