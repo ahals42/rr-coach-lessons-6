@@ -54,6 +54,9 @@ from .detection.detectors import (
 )
 from .inference import TECHNICAL_SUPPORT_RESPONSE, CHATBOT_HELP_RESPONSE
 from .inference import detect_science_for_lesson, science_module_for_lesson
+from .scope_patterns import DECLINE_PATTERNS, HARD_DECLINE_PATTERNS
+from .scope_check import classify_scope, ERROR_DECLINES_KEYWORD_HITS
+from .scope_allow import is_allowed, expand_for_retrieval
 from rag.retriever import _SCIENCE_MODULE_NAMES
 from .weekly_focus import (
     LESSON_GOALS,
@@ -333,7 +336,7 @@ class CoachAgent:
                     prefer_science=True,
                 )
             self._last_prefer_science = decision.prefer_science
-            retrieval_result = self.retriever.gather_context(user_input, decision, science_module=science_module)
+            retrieval_result = self.retriever.gather_context(expand_for_retrieval(user_input), decision, science_module=science_module)
             context_block = retrieval_result.build_prompt_context() if retrieval_result else None
             self.latest_retrieval = retrieval_result
             if retrieval_result and (retrieval_result.master_chunks or retrieval_result.activity_chunks or retrieval_result.home_chunks):
@@ -596,6 +599,14 @@ class CoachAgent:
                     reference_block_references,
                     max_refs=len(reference_block_references),
                 )
+                override_citations = True
+
+        keyword_hit = any(pattern.search(user_input) for pattern in DECLINE_PATTERNS)
+        hard_hit = any(pattern.search(user_input) for pattern in HARD_DECLINE_PATTERNS)
+        if hard_hit or keyword_hit or not is_allowed(user_input):
+            label = "LATER" if hard_hit else classify_scope(self.client, self.model, user_input)
+            if label == "LATER" or (keyword_hit and label == "ERROR" and ERROR_DECLINES_KEYWORD_HITS):
+                override_text = OUT_OF_RANGE_MESSAGE
                 override_citations = True
 
         messages = self._build_messages(

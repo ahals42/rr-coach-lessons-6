@@ -1,0 +1,58 @@
+"""Lesson-range decline patterns. Any match gets the out-of-range decline."""
+
+import re
+
+DECLINE_PATTERNS = [re.compile(p) for p in [
+    '(?i)\\bactive (person|self|retiree|someone)\\b',
+    '(?i)\\b(my|your|their) values?\\b.{0,40}\\b(exercis\\w*|activ\\w*|workouts?|movement)\\b',
+    '(?i)\\bvalues\\b.{0,30}\\b(help|connect|link|align)\\w*',
+    '(?i)\\b(negative thoughts?|thoughts? (about|running)|defus\\w*|unhelpful thoughts?)\\b',
+    '(?i)\\b(separate|distinguish)\\w* (who i am|myself|yourself) from\\b|\\bself[- ]as[- ]context\\b',
+    '(?i)\\bsocial (appraisal\\w*|identity)\\b|\\bidentity agents?\\b',
+    '(?i)\\bimagin\\w* (yourself|myself|my|your|experiences?)\\b|\\bimaginal\\b|\\bpossible (future )?self\\b',
+    '(?i)\\bidentit(y|ies)\\b',
+    '(?i)\\bflexib\\w* (about|with|in) (exercise|activity|workouts?)\\b.{0,30}\\b(who|identity|self)\\b',
+    '(?i)\\b(moving house|move house|new home|life change|major change|big life change)\\b',
+    '(?i)\\bpresent[- ]moment\\b|\\bstay\\w* in the moment\\b',
+    '(?i)\\bcommitted action\\b|\\bcommit\\w* to (my|your) values\\b',
+    '(?i)\\b(sleep|sleeping|insomnia|bedtime)\\b',
+    '(?i)\\bhabits?\\b',
+    '(?i)\\b(cues?|cue[- ]routine|cue[- ]response|instigation|recipe|if[- ]then|implementation intentions?)\\b',
+    '(?i)\\bexecution\\b',
+    '(?i)\\b(cue|trigger)s?\\b.{0,20}\\b(routine|habit|repeat|behaviou?r)\\b',
+    '(?i)\\b(66|sixty[- ]six)[- ]?days?\\b',
+    '(?i)\\bhow (long|many (days|weeks)) (does it|do i|will it|would it|to) (take|form|make|become)\\b',
+    '(?i)\\b(automaticity|asymptotic|automatic(ally)?|on autopilot|second nature|without (having to )?think(ing)? about it)\\b',
+    '(?i)\\b(hedonic|valence|arousal|feeling states?|affect (theory|research|states?))\\b',
+    '(?i)\\bidentit(y|ies)\\b',
+    '(?i)\\b(active (self|identity|person)|physical activity identity|identity-behaviou?r gap|identity agents?|self[- ]?(view|image|perception|concept|theor(y|ies)|verification)|possible (future )?(active )?self|future (active )?self|someone who (moves|is active|exercises|walks))\\b',
+    '(?i)\\b(building blocks?|behavio(u)?ral blocks?|cognitive blocks?|social blocks?|social (appraisals?|identification|identity|blocks?)|attachment ties?|perceived ability|imaginal|imagining (yourself|your future|myself))\\b',
+    '(?i)\\bvalues? (as|are|define|defines|shape|shapes|guide|guides|drive|drives|make up|makes up) (who|your identity|my identity|identity|you|me)\\b',
+    '(?i)\\b(acceptance (and|&) commitment|ACT therapy|defusion|defuse|defusing|committed action|self-as-context|psychological flexibility|present[- ]moment (awareness|values)|core processes?)\\b',
+    '(?-i:\\bACT\\b)',
+    '(?i)\\breflexive\\b',
+    '(?i)\\bbehavio(u)?ral regulation\\b',
+    '(?i)\\b(flexible standards|rules and standards|personal standards)\\b',
+    '(?i)\\bwho you connect with\\b',
+    '(?i)\\b(lessons? ?(7|8|9|10)|science ?3|weeks? ?(7|8|9|10))\\b',
+    '(?i)\\b(Joan|Gord)\\b',
+    '(?i)\\bsleep\\b',
+]]
+
+# Concept-specific phrasings that are declined outright, without asking the classifier.
+HARD_DECLINE_PATTERNS = [re.compile(p) for p in [
+    '(?i)\\bwhat (i|you) value\\b|\\bbase\\w* (my|your) (activity|exercise) on (what )?(i|you) value',
+    '(?i)\\bwhat (other )?people think of me\\b',
+    '(?i)\\bsleep\\b',
+    '(?i)\\battachment to (my|your|their) (partner|spouse|husband|wife|friends?|family|people)\\b',
+    "(?i)\\bother people'?s? (opinions?|views?|judgements?)\\b|\\bwhat (other )?people think of me\\b",
+    '(?i)\\b(reflect|show|say|express)\\w* (who (i|you) (am|are)|my (self|identity))\\b',
+    '(?i)\\bactive by choice\\b',
+    '(?i)\\bactive (person|self|retiree|someone)\\b',
+    '(?i)\\bidentit(y|ies)\\b',
+    '(?i)\\bidentity agents?\\b|\\bsocial (appraisal\\w*|identity)\\b',
+    '(?i)\\battachment ties?\\b',
+    '(?i)\\bdefus\\w*|\\bself[- ]as[- ]context\\b|\\bpsychological flexibility\\b|\\bcommitted action\\b',
+    '(?i)\\bimagin\\w* (yourself|myself|your future|my future|experiences?)\\b|\\bimaginal\\b|\\bpossible (future )?self\\b',
+    '(?i)\\bmoving house\\b|\\bbig life change\\b',
+]]
