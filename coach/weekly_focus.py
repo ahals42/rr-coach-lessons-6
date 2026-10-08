@@ -44,7 +44,7 @@ WEEK_FOCUS: Dict[int, str] = {}
 LESSON_TO_WEEK: Dict[int, int] = {1: 1, 2: 1, 3: 2, 4: 2, 5: 3, 6: 3}
 
 OUT_OF_RANGE_MESSAGE = (
-    "I can't talk about this. I can talk about lessons 1-6 and the science behind them, including the reflective and regulatory sides of the M-PAC framework (why to be active, how it feels, and how to turn intentions into action)."
+    "That’s outside of the information available to me as part of the group you’re in for this study. I can talk about lessons 1-6 and the science behind them, including the reflective and regulatory sides of the M-PAC framework (why to be active, how it feels, and how to turn intentions into action)."
 )
 
 CLARIFYING_QUESTION = "Which lesson (or week) number are you currently on?"
